@@ -9,7 +9,7 @@
 This is a fan-made recreation of the Octane. Rocket League and the Octane design belong to Psyonix / Epic Games; this project is not affiliated with or endorsed by them.
 
 ## Games
-- Elden Ring and Shadow of the Erdtree (FromSoftware / Bandai Namco): host game, read from the player's own install.
+- Elden Ring (FromSoftware / Bandai Namco): host game, read from the player's own install. The DLC is not required.
 - Rocket League (Psyonix / Epic Games): sounds read from the player's own install at runtime. No Rocket League files are included in this project.
 
 ## Libraries and tools shipped with the mod
