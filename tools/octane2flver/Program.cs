@@ -43,6 +43,8 @@ class Program
         // swapping X and Z both turns the car and mirrors it into left-handed space, so flip winding.
         // --reverse turns the model 180° around the vertical axis (a rotation, so winding is unaffected)
         bool reverse = Array.IndexOf(args, "--reverse") >= 0;
+        // --double-sided draws every face from both sides (the Octane model has open, one-sided panels)
+        bool doubleSided = Array.IndexOf(args, "--double-sided") >= 0;
         Vector3 Conv(Vector3D v) => reverse ? new Vector3(-v.Z, v.Y, -v.X) : new Vector3(v.Z, v.Y, v.X);
 
         // Overall bounds for scaling/centering across every part
@@ -112,7 +114,7 @@ class Program
                 DefaultBoneIndex = bone,
                 Vertices = verts,
                 VertexBuffers = new List<FLVER2.VertexBuffer> { new FLVER2.VertexBuffer(layoutIndex) },
-                FaceSets = template.FaceSets.Select(fs => new FLVER2.FaceSet(fs.Flags, false, fs.CullBackfaces, fs.Unk06, new List<int>(idx))).ToList(),
+                FaceSets = template.FaceSets.Select(fs => new FLVER2.FaceSet(fs.Flags, false, !doubleSided && fs.CullBackfaces, fs.Unk06, new List<int>(idx))).ToList(),
             };
             if (template.BoundingBox != null) mesh.BoundingBox = new FLVER2.Mesh.BoundingBoxes { Min = min, Max = max };
             meshes.Add(mesh);
