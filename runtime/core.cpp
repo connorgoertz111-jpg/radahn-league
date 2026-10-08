@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <unordered_map>
@@ -164,6 +165,65 @@ static uintptr_t FindParamTable(const wchar_t* wanted)
     return 0;
 }
 
+// Row data of a param by row id (0 if missing). Rows are {id, dataOffset, end} at table+0x40.
+static uintptr_t ParamRow(const wchar_t* param, uint64_t id)
+{
+    uintptr_t t = FindParamTable(param); uint16_t rows = 0;
+    if (!t || !Read(t + 0x0A, rows)) return 0;
+    for (int i = 0; i < rows; i++)
+    {
+        uint64_t rid = 0, off = 0;
+        if (Read(t + 0x40 + i * 24, rid) && rid == id && Read(t + 0x40 + i * 24 + 8, off)) return t + off;
+    }
+    return 0;
+}
+
+// SpEffectParam: +0x170 vfxId. SpEffectVfxParam: +0x00 midstSfxId, +0x08 initSfxId, +0x24 midstDmyId, +0x26 initDmyId.
+static void DumpEffectVisuals(std::initializer_list<int> ids)
+{
+    for (int id : ids)
+    {
+        uintptr_t sp = ParamRow(L"SpEffectParam", id); int vfx = -1; Read(sp + 0x170, vfx);
+        uintptr_t v = vfx > 0 ? ParamRow(L"SpEffectVfxParam", vfx) : 0;
+        int midst = -1, init = -1; short midstDmy = -1, initDmy = -1;
+        Read(v + 0x00, midst); Read(v + 0x08, init); Read(v + 0x24, midstDmy); Read(v + 0x26, initDmy);
+        Log("effect %d: row %p vfx %d -> midstSfx %d (dmy %d), initSfx %d (dmy %d)", id, (void*)sp, vfx, midst, midstDmy, init, initDmy);
+    }
+}
+
+// Boost flame setup: repurpose SpEffect 5232 (an unused developer placeholder with no visual) and give it a visual row
+// that no other effect references, so nothing else in the game changes. sfx/dummy are overridable via boost_fx.txt.
+static int g_flameVfxRow = -1;
+
+static void SetupBoostFlame(int sfxId, short dummyId)
+{
+    uintptr_t spTable = FindParamTable(L"SpEffectParam"), vfxTable = FindParamTable(L"SpEffectVfxParam");
+    uint16_t spRows = 0, vfxRows = 0;
+    if (!spTable || !vfxTable || !Read(spTable + 0x0A, spRows) || !Read(vfxTable + 0x0A, vfxRows)) return;
+    if (g_flameVfxRow < 0)
+    {
+        std::vector<int> used;
+        for (int i = 0; i < spRows; i++)
+        {
+            uint64_t off = 0; if (!Read(spTable + 0x40 + i * 24 + 8, off)) continue;
+            int v = 0; Read(spTable + off + 0x170, v); used.push_back(v);
+            for (int k = 0; k < 7; k++) { Read(spTable + off + 0x18C + k * 4, v); used.push_back(v); }
+        }
+        for (int i = vfxRows - 1; i >= 0 && g_flameVfxRow < 0; i--) // prefer high, rarely touched ids
+        {
+            uint64_t id = 0; Read(vfxTable + 0x40 + i * 24, id);
+            if (id > 0 && std::find(used.begin(), used.end(), (int)id) == used.end()) g_flameVfxRow = (int)id;
+        }
+        Log("boost flame: using free visual row %d", g_flameVfxRow);
+    }
+    uintptr_t vfx = ParamRow(L"SpEffectVfxParam", g_flameVfxRow), sp = ParamRow(L"SpEffectParam", 5232);
+    if (!vfx || !sp) return;
+    *(volatile int*)(vfx + 0x00) = sfxId;     // midstSfxId: looping visual while active
+    *(volatile short*)(vfx + 0x24) = dummyId; // midstDmyId: marker it is pinned to
+    *(volatile int*)(sp + 0x170) = g_flameVfxRow;
+    Log("boost flame: effect 5232 -> visual row %d, sfx %d at marker %d", g_flameVfxRow, sfxId, dummyId);
+}
+
 struct CamRow { uintptr_t row; float dist, fov; };
 static std::vector<CamRow> g_camOriginal;
 
@@ -274,6 +334,57 @@ static void LogHorseMatrices()
     }
 }
 
+// --- Game "special effects" (SpEffect) apply/remove: byte patterns as documented by The Grand Archives' table ---
+using AddSpEffectFn = void* (*)(uintptr_t chrIns, int id, int unk);
+using RemoveSpEffectFn = void* (*)(uintptr_t specialEffect, int id);
+static AddSpEffectFn g_addSpEffect;
+static RemoveSpEffectFn g_removeSpEffect;
+
+static void FindSpEffectFunctions()
+{
+    auto add = Scan(Section(".text"), "0f 28 0d ?? ?? ?? ?? ?? 8d ?? ?? 0f 29 ?? ?? ?? 0f b6 d8");
+    auto rem = Scan(Section(".text"), "48 83 EC 28 8B C2 48 8B 51 08 48 85 D2 ?? ?? 90");
+    if (add.size() == 1) g_addSpEffect = (AddSpEffectFn)(add[0] - 0x1D);
+    if (rem.size() == 1) g_removeSpEffect = (RemoveSpEffectFn)rem[0];
+    Log("AddSpEffect %p, RemoveSpEffect %p", (void*)g_addSpEffect, (void*)g_removeSpEffect);
+}
+
+static void AddEffect(uintptr_t chr, int id) { if (chr && id && g_addSpEffect) g_addSpEffect(chr, id, 1); }
+static void RemoveEffect(uintptr_t chr, int id)
+{
+    uintptr_t se = 0;
+    if (chr && id && g_removeSpEffect && Read(chr + 0x178, se) && se) g_removeSpEffect(se, id);
+}
+
+// Boost flame: effect applied to Torrent while boosting (id overridable live via boost_fx.txt)
+static std::atomic<int> g_boostFx{ 5232 };
+
+// --- Boost: hold B (controller) or Space (keyboard) while riding ---
+// Torrent's movement comes from his animations, so boosting plays them faster.
+// Animation speed = [[ChrIns+0x190]+0x28]+0x17C8 (float, 1 = normal).
+#include <xinput.h>
+static float g_boostRate = 2.2f; // overridable live via boost.txt next to the DLL
+static std::atomic<bool> g_boosting{ false };
+
+static bool BoostHeld()
+{
+    XINPUT_STATE s{};
+    for (DWORD pad = 0; pad < 4; pad++)
+        if (XInputGetState(pad, &s) == ERROR_SUCCESS && (s.Gamepad.wButtons & XINPUT_GAMEPAD_B)) return true;
+    DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid); // keyboard only while the game is in front
+    return pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_SPACE) & 0x8000);
+}
+
+static void SetAnimSpeed(uintptr_t chr, float rate)
+{
+    uintptr_t bag = 0, anim = 0;
+    if (chr && Read(chr + 0x190, bag) && bag && Read(bag + 0x28, anim) && anim)
+    {
+        float cur = 0;
+        if (Read(anim + 0x17C8, cur) && cur != rate) *(volatile float*)(anim + 0x17C8) = rate;
+    }
+}
+
 // --- Keeping the car level ---
 // Torrent's ChrIns+0x58 object holds two 4x4 transforms: +0x1B0 stays level (logical placement) and +0x230 is the
 // drawn model transform, which the game tilts with the gallop and the ground. While riding, a fast loop copies the
@@ -293,6 +404,18 @@ static DWORD WINAPI LevelThread(LPVOID)
             float level[12];
             if (Read(ctrl + 0x1B0, level)) memcpy((void*)(ctrl + 0x230), level, sizeof level); // rotation rows only
         }
+        static uintptr_t boostedHorse = 0;
+        bool boost = horse && BoostHeld();
+        static uintptr_t fxHorse = 0; static int fxId = 0;
+        if (boost != g_boosting)
+        {
+            g_boosting = boost;
+            if (boost) { fxHorse = horse; fxId = g_boostFx; AddEffect(fxHorse, fxId); }
+            else { RemoveEffect(fxHorse, fxId); fxHorse = 0; }
+            Log(boost ? "boost on (fx %d)" : "boost off", fxId);
+        }
+        if (horse) { SetAnimSpeed(horse, boost ? g_boostRate : 1.0f); boostedHorse = horse; }
+        else if (boostedHorse) { boostedHorse = 0; }
         Sleep(1);
     }
     timeEndPeriod(1);
@@ -308,6 +431,10 @@ static DWORD WINAPI MainThread(LPVOID)
     uintptr_t gameDataMan = StaticFromPattern("48 8B 05 ?? ?? ?? ?? 48 85 C0 74 05 48 8B 40 58 C3 C3");
     Log("%zu singletons; WorldChrMan static %p, GameDataMan static %p", singletons.size(), (void*)worldChrMan, (void*)gameDataMan);
     g_regulationManager = singletons.count("CSRegulationManager") ? singletons["CSRegulationManager"] : 0;
+    FindSpEffectFunctions();
+    for (int tries = 0; tries < 60 && !FindParamTable(L"SpEffectParam"); tries++) Sleep(500);
+    DumpEffectVisuals({ 5232, 415, 416, 460, 1776, 1627, 3160, 1630000, 1632000, 1703000 });
+    for (int b : { 2500210, 2500220, 4040170, 4510330, 8110000, 8110001, 8110010, 10611000 }) { int sfx = -1; Read(ParamRow(L"Bullet", b) + 0x04, sfx); Log("bullet %d visual %d", b, sfx); }
 
     int lastState = -12345;
     uintptr_t lastPlayer = 1;
@@ -319,6 +446,10 @@ static DWORD WINAPI MainThread(LPVOID)
             if (FILE* cf = _wfopen((g_dir + L"camera.txt").c_str(), L"r")) { fscanf(cf, "%f %f", &mult, &fov); fclose(cf); }
             if ((mult != curMult || fov != curFov) && ApplyCamera(mult, fov)) { curMult = mult; curFov = fov; }
         }
+        if (FILE* bf = _wfopen((g_dir + L"boost.txt").c_str(), L"r")) { float r = 0; if (fscanf(bf, "%f", &r) == 1 && r >= 1 && r <= 5 && r != g_boostRate) { g_boostRate = r; Log("boost rate %.2f", r); } fclose(bf); }
+        { static int curSfx = 0, curDmy = 0; int sfx = 625015, dmy = 900; // Crucible Knight fire breath at the exhaust marker added to the car model
+          if (FILE* ff = _wfopen((g_dir + L"boost_fx.txt").c_str(), L"r")) { fscanf(ff, "%d %d", &sfx, &dmy); fclose(ff); }
+          if (sfx != curSfx || dmy != curDmy) { SetupBoostFlame(sfx, (short)dmy); curSfx = sfx; curDmy = dmy; } }
         static int beat = 0; if (++beat % 40 == 0) Log("alive");
         uintptr_t player = 0;                                        // PlayerIns = [[[WorldChrMan]+10EF8]+0]
         Read(Chase(worldChrMan, { 0x10EF8, 0x0 }), player);

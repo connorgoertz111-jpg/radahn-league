@@ -236,6 +236,8 @@ class Program
         int canopyArg = Array.IndexOf(args, "--canopy");
         if (canopyArg >= 0) AddCanopy(meshes[0], meshes, min, max, float.Parse(args[canopyArg + 1], System.Globalization.CultureInfo.InvariantCulture), bone, uvCount, Path.ChangeExtension(outPath, null) + "_canopy.ppm");
 
+        // Debug: rear-most geometry (exhaust pipes) in final car space
+        foreach (var pm in meshes) { var rear = pm.Vertices.Where(v => v.Position.Z > max.Z - 0.7f && v.Position.Y > 0.3f && v.Position.Y < 1.1f && Math.Abs(v.Position.X) < 0.7f).ToList(); if (rear.Count > 0) foreach (var side in new[] { -1, 1 }) { var s = rear.Where(v => Math.Sign(v.Position.X) == side).ToList(); if (s.Count > 0) Console.WriteLine($"rear side {side}: {s.Count} verts, x {s.Min(v => v.Position.X):F2}..{s.Max(v => v.Position.X):F2} y {s.Min(v => v.Position.Y):F2}..{s.Max(v => v.Position.Y):F2} z {s.Min(v => v.Position.Z):F2}..{s.Max(v => v.Position.Z):F2}"); } }
         fl.Meshes = meshes;
         fl.Materials = materials;
         fl.Header.BoundingBoxMin = Vector3.Min(fl.Header.BoundingBoxMin, min); fl.Header.BoundingBoxMax = Vector3.Max(fl.Header.BoundingBoxMax, max);

@@ -38,6 +38,36 @@ class Program
             foreach (var d in fl.Dummies) Console.WriteLine($"dummy ref={d.ReferenceID} pos={d.Position} parent={(d.ParentBoneIndex >= 0 ? fl.Bones[d.ParentBoneIndex].Name : "-")} attach={(d.AttachBoneIndex >= 0 ? fl.Bones[d.AttachBoneIndex].Name : "-")}");
             return 0;
         }
+        if (args.Length == 9 && args[0] == "adddummy")
+        {
+            // adddummy <in.chrbnd.dcx> <out.chrbnd.dcx> <templateRefId> <newRefId> <x> <y> <z> <fwdZ>:
+            // copies a dummy (keeping its parent/attach setup) to a new position, facing +Z or -Z
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var bnd = BND4.Read(args[1]);
+            var file = bnd.Files.First(f => f.Name.EndsWith(".flver", StringComparison.OrdinalIgnoreCase));
+            var fl = FLVER2.Read(file.Bytes);
+            var tpl = fl.Dummies.First(d => d.ReferenceID == short.Parse(args[3]));
+            short newId = short.Parse(args[4]);
+            fl.Dummies.RemoveAll(d => d.ReferenceID == newId);
+            var nd = new FLVER.Dummy
+            {
+                Position = new System.Numerics.Vector3(float.Parse(args[5], ci), float.Parse(args[6], ci), float.Parse(args[7], ci)),
+                Forward = new System.Numerics.Vector3(0, 0, float.Parse(args[8], ci)),
+                Upward = new System.Numerics.Vector3(0, 1, 0),
+                ReferenceID = newId,
+                ParentBoneIndex = tpl.ParentBoneIndex,
+                AttachBoneIndex = tpl.AttachBoneIndex,
+                Flag1 = tpl.Flag1,
+                UseUpwardVector = true,
+                Color = tpl.Color,
+            };
+            fl.Dummies.Add(nd);
+            Console.WriteLine($"added dummy {newId} at {nd.Position} (parent {tpl.ParentBoneIndex}, attach {tpl.AttachBoneIndex})");
+            file.Bytes = fl.Write();
+            Directory.CreateDirectory(Path.GetDirectoryName(args[2]));
+            bnd.Write(args[2]);
+            return 0;
+        }
         if (args.Length == 5 && args[0] == "dummy")
         {
             // dummy <in.chrbnd.dcx> <out.chrbnd.dcx> <referenceId> <dy>: move every dummy with that reference ID vertically
