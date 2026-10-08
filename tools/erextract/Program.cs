@@ -37,6 +37,13 @@ class Program
             foreach (var l in fl.BufferLayouts) Console.WriteLine("layout " + string.Join(" ", l.Select(s => $"{s.Semantic}:{s.Type}")));
             return 0;
         }
+        if (args.Length == 2 && args[0] == "tpf")
+        {
+            var tpf = TPF.Read(BND4.Read(args[1]).Files.First(f => f.Name.EndsWith(".tpf")).Bytes);
+            Console.WriteLine($"platform {tpf.Platform} encoding {tpf.Encoding} flag2 {tpf.Flag2}");
+            foreach (var t in tpf.Textures.Take(12)) Console.WriteLine($"{t.Name} format={t.Format} type={t.Type} mips={t.Mipmaps} flags1={t.Flags1} bytes={t.Bytes.Length} dds4={System.Text.Encoding.ASCII.GetString(t.Bytes, 84, 4)}");
+            return 0;
+        }
         if (args.Length == 3 && args[0] == "msb")
         {
             // No MSBE reader in this SoulsFormats build: list UTF-16 strings matching a regex instead
