@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <ctime>
 #include <string>
 #include <unordered_map>
@@ -195,6 +196,109 @@ static void RestoreCamera()
     g_camOriginal.clear();
 }
 
+// --- Finding Torrent (diagnostic) ---
+// ChrIns +0x190 = module bag; bag +0x68 = physics module (+0x70 position, +0x54 orientation); bag +0xE8 = ride module.
+struct Vec3 { float x, y, z; };
+static bool ChrPosition(uintptr_t chr, Vec3& p)
+{
+    uintptr_t bag = 0, phys = 0;
+    return Read(chr + 0x190, bag) && bag && Read(bag + 0x68, phys) && phys && Read(phys + 0x70, p);
+}
+
+static void SearchHorseMatrices(uintptr_t horse);
+static std::atomic<uintptr_t> g_levelHorse{ 0 }; // Torrent ChrIns while riding (see LevelThread)
+static void FindHorse(uintptr_t player)
+{
+    Vec3 me{}; if (!ChrPosition(player, me)) { Log("ride scan: no player position"); return; }
+    uintptr_t bag = 0, ride = 0;
+    if (!Read(player + 0x190, bag) || !Read(bag + 0xE8, ride) || !ride) { Log("ride scan: no ride module"); return; }
+    Log("ride scan: player at %.2f %.2f %.2f, ride module %p", me.x, me.y, me.z, (void*)ride);
+    for (uintptr_t off = 0; off < 0x400; off += 8)
+    {
+        uintptr_t q = 0; if (!Read(ride + off, q) || q < 0x10000) continue;
+        for (uintptr_t inner : { (uintptr_t)0, (uintptr_t)8, (uintptr_t)0x10 })
+        {
+            uintptr_t chr = q; if (inner && (!Read(q + inner, chr) || chr < 0x10000)) continue;
+            Vec3 p{}; if (!ChrPosition(chr, p) || chr == player) continue;
+            float dx = p.x - me.x, dy = p.y - me.y, dz = p.z - me.z;
+            if (dx * dx + dy * dy + dz * dz < 16) Log("ride scan: candidate [ride+%llX]%s -> chr %p at %.2f %.2f %.2f", (unsigned long long)off, inner ? "+deref" : "", (void*)chr, p.x, p.y, p.z);
+            if (off == 0x1E8 && !inner) { g_levelHorse = chr; Log("leveling Torrent %p", (void*)chr); }
+        }
+    }
+}
+
+// --- Torrent transform search (diagnostic) ---
+// Looks for 4x4 float matrices (row-major, translation in the last row) whose translation is Torrent's position,
+// in Torrent's ChrIns and in every object it points to. Logs each with its "up" row so pitch/roll show up.
+static std::vector<std::pair<std::string, uintptr_t>> g_horseMatrices;
+
+static void SearchHorseMatrices(uintptr_t horse)
+{
+    Vec3 pos{}; if (!ChrPosition(horse, pos)) return;
+    g_horseMatrices.clear();
+    auto scan = [&](uintptr_t base, const std::string& name) {
+        for (uintptr_t o = 0x30; o < 0x800; o += 4)
+        {
+            Vec3 t{}; if (!Read(base + o, t)) break;
+            if (fabsf(t.x - pos.x) > 0.05f || fabsf(t.y - pos.y) > 0.6f || fabsf(t.z - pos.z) > 0.05f) continue;
+            float m[12]; if (!Read(base + o - 0x30, m)) continue;
+            float up2 = m[4] * m[4] + m[5] * m[5] + m[6] * m[6], r2 = m[0] * m[0] + m[1] * m[1] + m[2] * m[2];
+            if (fabsf(up2 - 1) > 0.05f || fabsf(r2 - 1) > 0.05f) continue; // not a rotation
+            char key[96]; snprintf(key, sizeof key, "%s+%llX", name.c_str(), (unsigned long long)(o - 0x30));
+            g_horseMatrices.push_back({ key, base + o - 0x30 });
+        }
+    };
+    scan(horse, "chr");
+    for (uintptr_t o = 0; o < 0x600; o += 8)
+    {
+        uintptr_t p = 0; if (!Read(horse + o, p) || p < 0x10000) continue;
+        char n[32]; snprintf(n, sizeof n, "[chr+%llX]", (unsigned long long)o); scan(p, n);
+    }
+    uintptr_t bag = 0; Read(horse + 0x190, bag);
+    for (uintptr_t o = 0; bag && o < 0x200; o += 8)
+    {
+        uintptr_t p = 0; if (!Read(bag + o, p) || p < 0x10000) continue;
+        char n[32]; snprintf(n, sizeof n, "[bag+%llX]", (unsigned long long)o); scan(p, n);
+    }
+    Log("matrix search: %zu candidates", g_horseMatrices.size());
+}
+
+static void LogHorseMatrices()
+{
+    for (auto& [name, at] : g_horseMatrices)
+    {
+        float m[12]; if (!Read(at, m)) continue;
+        // up vector = row 1; pitch/roll in degrees from how far "up" leans
+        float pitch = asinf(fmaxf(-1, fminf(1, m[6]))) * 57.3f, roll = asinf(fmaxf(-1, fminf(1, m[4]))) * 57.3f;
+        Log("  %s up=(%.2f %.2f %.2f) pitch %.0f roll %.0f", name.c_str(), m[4], m[5], m[6], pitch, roll);
+    }
+}
+
+// --- Keeping the car level ---
+// Torrent's ChrIns+0x58 object holds two 4x4 transforms: +0x1B0 stays level (logical placement) and +0x230 is the
+// drawn model transform, which the game tilts with the gallop and the ground. While riding, a fast loop copies the
+// level rotation into the drawn transform (keeping its position), so the car stays flat.
+
+static HANDLE g_levelThread;
+
+static DWORD WINAPI LevelThread(LPVOID)
+{
+    timeBeginPeriod(1);
+    while (g_running)
+    {
+        uintptr_t horse = g_levelHorse;
+        uintptr_t ctrl = 0;
+        if (horse && Read(horse + 0x58, ctrl) && ctrl)
+        {
+            float level[12];
+            if (Read(ctrl + 0x1B0, level)) memcpy((void*)(ctrl + 0x230), level, sizeof level); // rotation rows only
+        }
+        Sleep(1);
+    }
+    timeEndPeriod(1);
+    return 0;
+}
+
 static DWORD WINAPI MainThread(LPVOID)
 {
     Log("core started");
@@ -224,6 +328,9 @@ static DWORD WINAPI MainThread(LPVOID)
         Read(ride + 0x30, hp);
         bool riding = state == 13;
         if (player) SetHidden(player, riding); // enforced every tick: no-op unless the flag differs
+        static bool scanned = false;
+        if (!riding) { scanned = false; g_levelHorse = 0; }
+        else if (player && !scanned) { FindHorse(player); scanned = true; }
         if (player != lastPlayer || state != lastState)
         {
             Log("player %p, torrent state %d, torrent hp %d", (void*)player, state, hp);
@@ -241,12 +348,14 @@ extern "C" __declspec(dllexport) void rl_start(const wchar_t* dir)
     g_dir = dir;
     g_running = true;
     g_thread = CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
+    g_levelThread = CreateThread(nullptr, 0, LevelThread, nullptr, 0, nullptr);
 }
 
 extern "C" __declspec(dllexport) void rl_stop()
 {
     g_running = false;
     if (g_thread) { WaitForSingleObject(g_thread, 5000); CloseHandle(g_thread); g_thread = nullptr; }
+    if (g_levelThread) { WaitForSingleObject(g_levelThread, 2000); CloseHandle(g_levelThread); g_levelThread = nullptr; }
     if (g_log) { fclose(g_log); g_log = nullptr; }
 }
 

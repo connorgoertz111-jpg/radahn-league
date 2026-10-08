@@ -172,7 +172,7 @@ class Program
         int layoutIndex = fl.BufferLayouts.FindIndex(l => l.Any(s => s.Semantic == FLVER.LayoutSemantic.BoneWeights));
         int uvCount = fl.BufferLayouts[layoutIndex].Count(s => s.Semantic == FLVER.LayoutSemantic.UV);
         // Bind to the bone that carries most of the original geometry, or a named bone (e.g. a fixed base that doesn't swivel)
-        int bone = boneName != null ? fl.Bones.FindIndex(b => b.Name == boneName) : fl.Meshes.SelectMany(m => m.Vertices)
+        int bone = boneName != null ? (int.TryParse(boneName, out int boneNumber) ? boneNumber : fl.Bones.FindIndex(b => b.Name == boneName)) : fl.Meshes.SelectMany(m => m.Vertices)
             .Select(v => { int best = 0; for (int k = 1; k < 4; k++) if (v.BoneWeights[k] > v.BoneWeights[best]) best = k; return v.BoneIndices[best]; })
             .GroupBy(b => b).OrderByDescending(g => g.Count()).First().Key;
 
