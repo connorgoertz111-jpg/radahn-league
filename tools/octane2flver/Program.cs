@@ -17,6 +17,28 @@ class Program
     const string Prefix = "octane";
 
     // Debug: connected pieces of a mesh (by shared vertices) with their bounds, to locate the wheels
+    // --sphere <diameter>: instead of an FBX, build a geodesic ball (subdivided icosahedron) for the Rocket League-style
+    // ball. One part, UVs from latitude/longitude so a generated panel texture wraps around it.
+    static (List<Vector3> pos, List<int> tris) Icosphere(int subdivisions)
+    {
+        float t = (1 + MathF.Sqrt(5)) / 2;
+        var p = new List<Vector3> { new(-1, t, 0), new(1, t, 0), new(-1, -t, 0), new(1, -t, 0), new(0, -1, t), new(0, 1, t), new(0, -1, -t), new(0, 1, -t), new(t, 0, -1), new(t, 0, 1), new(-t, 0, -1), new(-t, 0, 1) };
+        p = p.Select(Vector3.Normalize).ToList();
+        var f = new List<int> { 0,11,5, 0,5,1, 0,1,7, 0,7,10, 0,10,11, 1,5,9, 5,11,4, 11,10,2, 10,7,6, 7,1,8, 3,9,4, 3,4,2, 3,2,6, 3,6,8, 3,8,9, 4,9,5, 2,4,11, 6,2,10, 8,6,7, 9,8,1 };
+        for (int s = 0; s < subdivisions; s++)
+        {
+            var mid = new Dictionary<(int, int), int>(); var nf = new List<int>();
+            int M(int a, int b) { var k = a < b ? (a, b) : (b, a); if (!mid.TryGetValue(k, out int i)) { p.Add(Vector3.Normalize((p[a] + p[b]) / 2)); i = mid[k] = p.Count - 1; } return i; }
+            for (int i = 0; i < f.Count; i += 3)
+            {
+                int a = f[i], b = f[i + 1], c = f[i + 2], ab = M(a, b), bc = M(b, c), ca = M(c, a);
+                nf.AddRange(new[] { a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca });
+            }
+            f = nf;
+        }
+        return (p, f);
+    }
+
     static void ListPieces(FLVER2.Mesh mesh, string name)
     {
         int n = mesh.Vertices.Count;
@@ -151,6 +173,21 @@ class Program
 
     static int Main(string[] args)
     {
+        if (args[0] == "makeball")
+        {
+            // makeball <out.obj> <subdivisions>: unit geodesic sphere with lat/long UVs and material "ball"
+            var (sp, st) = Icosphere(int.Parse(args[2]));
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            using var w = new StreamWriter(args[1]);
+            w.WriteLine("mtllib ball.mtl"); w.WriteLine("usemtl ball");
+            foreach (var v in sp) w.WriteLine(string.Format(ci, "v {0} {1} {2}", v.X, v.Y, v.Z));
+            foreach (var v in sp) w.WriteLine(string.Format(ci, "vt {0} {1}", 0.5 + Math.Atan2(v.Z, v.X) / (2 * Math.PI), 0.5 - Math.Asin(Math.Clamp(v.Y, -1f, 1f)) / Math.PI));
+            foreach (var v in sp) w.WriteLine(string.Format(ci, "vn {0} {1} {2}", v.X, v.Y, v.Z));
+            for (int i = 0; i < st.Count; i += 3) w.WriteLine($"f {st[i] + 1}/{st[i] + 1}/{st[i] + 1} {st[i + 1] + 1}/{st[i + 1] + 1}/{st[i + 1] + 1} {st[i + 2] + 1}/{st[i + 2] + 1}/{st[i + 2] + 1}");
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[1])), "ball.mtl"), "newmtl ball\n");
+            Console.WriteLine($"wrote {args[1]}: {sp.Count} verts, {st.Count / 3} tris");
+            return 0;
+        }
         string templatePath = args[0], fbxPath = args[1], outPath = args[2];
         float targetLength = float.Parse(args[3]);
         string boneName = args.Length > 4 && args[4] != "-" ? args[4] : null;

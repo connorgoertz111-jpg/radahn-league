@@ -509,6 +509,33 @@ static void SearchBoneMatrices(uintptr_t horse)
     Log("bone search done (%zu nodes visited)", seen.size());
 }
 
+// --- Ball: projectiles (Bullet) spawned through CSBulletManager ---
+// Spawn function byte pattern and argument layout as documented by The Grand Archives' table:
+//   fn(CSBulletManager*, out handle*, params*, unk*); params +0x14 = bullet id, +0x80 = x, y, z.
+using SpawnBulletFn = void* (*)(uintptr_t manager, void* outHandle, void* params, void* unk);
+static SpawnBulletFn g_spawnBullet;
+static uintptr_t g_bulletManager; // static address holding the CSBulletManager instance
+
+static void FindBulletSpawn(std::unordered_map<std::string, uintptr_t>& singletons)
+{
+    auto hits = Scan(Section(".text"), "40 53 55 56 57 48 81 EC 98 07 00 00 48 C7 44 24 50 FE FF FF FF");
+    if (hits.size() == 1) g_spawnBullet = (SpawnBulletFn)hits[0];
+    g_bulletManager = singletons.count("CSBulletManager") ? singletons["CSBulletManager"] : 0;
+    Log("SpawnBullet %p (%zu hits), CSBulletManager static %p", (void*)g_spawnBullet, hits.size(), (void*)g_bulletManager);
+}
+
+static bool SpawnBullet(int id, Vec3 at)
+{
+    uintptr_t manager = 0;
+    if (!g_spawnBullet || !Read(g_bulletManager, manager) || !manager) return false;
+    alignas(16) uint8_t mem[0x200] = {};
+    *(int*)(mem + 0x14) = id;
+    *(Vec3*)(mem + 0x80) = at;
+    g_spawnBullet(manager, mem + 0x180, mem, mem + 0x1C0);
+    Log("spawned bullet %d at %.1f %.1f %.1f -> handle %08X", id, at.x, at.y, at.z, *(uint32_t*)(mem + 0x180));
+    return *(uint32_t*)(mem + 0x180) != 0xFFFFFFFF;
+}
+
 // --- Rocket League sounds, decoded from the player's own Rocket League install ---
 // Nothing from Rocket League ships with the mod: on first launch vgmstream (bundled, ISC license) decodes two
 // sounds from the player's Rocket League banks into a local cache, and the add-on plays them from there.
@@ -652,6 +679,7 @@ static DWORD WINAPI MainThread(LPVOID)
     Log("%zu singletons; WorldChrMan static %p, GameDataMan static %p", singletons.size(), (void*)worldChrMan, (void*)gameDataMan);
     g_regulationManager = singletons.count("CSRegulationManager") ? singletons["CSRegulationManager"] : 0;
     FindSpEffectFunctions();
+    FindBulletSpawn(singletons);
     PrepareSounds();
     for (int tries = 0; tries < 60 && !FindParamTable(L"SpEffectParam"); tries++) Sleep(500);
     DumpEffectVisuals({ 5232, 415, 416, 460, 1776, 1627, 3160, 1630000, 1632000, 1703000 });
@@ -678,6 +706,9 @@ static DWORD WINAPI MainThread(LPVOID)
             bool n9 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F9) & 0x8000), n10 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F10) & 0x8000);
             if (n9 && !f9) { PlayRl(kHit); Log("played ball hit"); }
             if (n10 && !f10) { PlayRl(kGoal); Log("played goal"); }
+            static bool f8 = false; bool n8 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F8) & 0x8000);
+            if (n8 && !f8 && g_levelHorse) { int id = 3850310; if (FILE* bf2 = _wfopen((g_dir + L"ball_test.txt").c_str(), L"r")) { fscanf(bf2, "%d", &id); fclose(bf2); } Vec3 p{}; if (ChrPosition(g_levelHorse, p)) { p.y += 3; SpawnBullet(id, p); } }
+            f8 = n8;
             f9 = n9; f10 = n10;
         }
         static int beat = 0; if (++beat % 40 == 0) Log("alive");
