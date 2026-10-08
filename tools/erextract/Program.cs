@@ -38,6 +38,18 @@ class Program
             foreach (var d in fl.Dummies) Console.WriteLine($"dummy ref={d.ReferenceID} pos={d.Position} parent={(d.ParentBoneIndex >= 0 ? fl.Bones[d.ParentBoneIndex].Name : "-")} attach={(d.AttachBoneIndex >= 0 ? fl.Bones[d.AttachBoneIndex].Name : "-")}");
             return 0;
         }
+        if (args.Length == 3 && args[0] == "bonetrans")
+        {
+            // bonetrans <chrbnd> <flverName>: index, name, parent, local translation of every bone
+            var bnd = BND4.Read(args[1]);
+            var fl = FLVER2.Read(bnd.Files.First(f => f.Name.EndsWith(args[2], StringComparison.OrdinalIgnoreCase)).Bytes);
+            for (int i = 0; i < fl.Bones.Count; i++)
+            {
+                var b = fl.Bones[i];
+                Console.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0}\t{1}\t{2}\t{3:F4}\t{4:F4}\t{5:F4}", i, b.Name, b.ParentIndex, b.Translation.X, b.Translation.Y, b.Translation.Z));
+            }
+            return 0;
+        }
         if (args.Length == 9 && args[0] == "adddummy")
         {
             // adddummy <in.chrbnd.dcx> <out.chrbnd.dcx> <templateRefId> <newRefId> <x> <y> <z> <fwdZ>:

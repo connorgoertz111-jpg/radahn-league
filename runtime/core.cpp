@@ -266,6 +266,9 @@ static bool ChrPosition(uintptr_t chr, Vec3& p)
 }
 
 static void SearchHorseMatrices(uintptr_t horse);
+static void SearchBoneMatrices(uintptr_t horse);
+static void SearchTorrentPose(uintptr_t horse);
+static std::atomic<uintptr_t> g_poseArray{ 0 }; // candidate Torrent pose (Havok QS transforms)
 static std::atomic<uintptr_t> g_levelHorse{ 0 }; // Torrent ChrIns while riding (see LevelThread)
 static void FindHorse(uintptr_t player)
 {
@@ -282,7 +285,7 @@ static void FindHorse(uintptr_t player)
             Vec3 p{}; if (!ChrPosition(chr, p) || chr == player) continue;
             float dx = p.x - me.x, dy = p.y - me.y, dz = p.z - me.z;
             if (dx * dx + dy * dy + dz * dz < 16) Log("ride scan: candidate [ride+%llX]%s -> chr %p at %.2f %.2f %.2f", (unsigned long long)off, inner ? "+deref" : "", (void*)chr, p.x, p.y, p.z);
-            if (off == 0x1E8 && !inner) { g_levelHorse = chr; Log("leveling Torrent %p", (void*)chr); }
+            if (off == 0x1E8 && !inner) { g_levelHorse = chr; Log("leveling Torrent %p", (void*)chr); SearchTorrentPose(chr); }
         }
     }
 }
@@ -359,6 +362,223 @@ static void RemoveEffect(uintptr_t chr, int id)
 // Boost flame: effect applied to Torrent while boosting (id overridable live via boost_fx.txt)
 static std::atomic<int> g_boostFx{ 5232 };
 
+// --- Bone matrix search (diagnostic, for spinning wheels) ---
+// Breadth-first walk of pointers reachable from Torrent's ChrIns (3 levels), looking for long runs of affine matrices:
+// 4x4 (64 bytes, last column 0,0,0,1) or 3x4 (48 bytes, orthonormal 3x3). Torrent has 366 bones.
+static bool LooksAffine64(const float* m)
+{
+    if (fabsf(m[3]) > 1e-4f || fabsf(m[7]) > 1e-4f || fabsf(m[11]) > 1e-4f || fabsf(m[15] - 1) > 1e-4f) return false;
+    for (int r = 0; r < 3; r++) { float l = m[r * 4] * m[r * 4] + m[r * 4 + 1] * m[r * 4 + 1] + m[r * 4 + 2] * m[r * 4 + 2]; if (l < 0.001f || l > 100) return false; }
+    for (int i = 0; i < 16; i++) if (!std::isfinite(m[i])) return false;
+    return true;
+}
+
+// Havok hkQsTransform: translation(4) rotation quaternion(4) scale(4) = 48 bytes
+static bool LooksQs(const float* t)
+{
+    for (int i = 0; i < 12; i++) if (!std::isfinite(t[i])) return false;
+    float q = t[4] * t[4] + t[5] * t[5] + t[6] * t[6] + t[7] * t[7];
+    if (fabsf(q - 1) > 0.01f) return false;
+    if (fabsf(t[8] - 1) > 0.2f || fabsf(t[9] - 1) > 0.2f || fabsf(t[10] - 1) > 0.2f) return false;
+    return fabsf(t[0]) < 100 && fabsf(t[1]) < 100 && fabsf(t[2]) < 100;
+}
+// Row-major 3x4: three rows of (rotation row, translation) = 48 bytes
+static bool LooksAffine48(const float* m)
+{
+    for (int i = 0; i < 12; i++) if (!std::isfinite(m[i])) return false;
+    for (int r = 0; r < 3; r++) { float l = m[r * 4] * m[r * 4] + m[r * 4 + 1] * m[r * 4 + 1] + m[r * 4 + 2] * m[r * 4 + 2]; if (fabsf(l - 1) > 0.05f) return false; }
+    return true;
+}
+
+// Torrent signature: local bone offsets from his skeleton (c8000.flver), used to recognise his pose array
+static const float kTorrentOffsets[][3] = {
+    { 0.0f, 1.1409f, 0.5735f }, { -0.0696f, 0.2002f, 0.6515f }, { -0.0256f, 0.2002f, 0.9567f }, { 0.0f, 1.1633f, 0.4744f },
+    { 0.2904f, 0.0f, 0.0f }, { 0.2423f, 0.2024f, 0.3677f }, { 0.0990f, 0.0f, -0.0223f } };
+
+static int TorrentMatches(uintptr_t qsArray, int count)
+{
+    int hits = 0;
+    for (int k = 0; k < count; k++)
+    {
+        float t[3]; if (!Read(qsArray + k * 48, t)) break;
+        for (auto& s : kTorrentOffsets)
+            if (fabsf(fabsf(t[0]) - fabsf(s[0])) < 0.003f && fabsf(fabsf(t[1]) - fabsf(s[1])) < 0.003f && fabsf(fabsf(t[2]) - fabsf(s[2])) < 0.003f) { hits++; break; }
+    }
+    return hits;
+}
+
+static void SearchTorrentPose(uintptr_t horse)
+{
+    // Direct path found by the earlier broad search: [[[anim+0x15A8]+0x10]+0x118] (123 QS transforms, 5 Torrent offsets)
+    {
+        uintptr_t bag0 = 0, anim0 = 0;
+        if (Read(horse + 0x190, bag0) && Read(bag0 + 0x28, anim0) && anim0)
+        {
+            uintptr_t arr = 0; int qs = 0; float m[12];
+            for (int tries = 0; tries < 40 && g_running && qs < 20; tries++)
+            {
+                arr = 0; qs = 0; Read(Chase(anim0 + 0x15A8, { 0x10, 0x118 }), arr);
+                while (arr && qs < 400 && Read(arr + qs * 48, m) && LooksQs(m)) qs++;
+                if (qs < 20) Sleep(250);
+            }
+            Log("pose direct: %p, %d QS, %d Torrent matches", (void*)arr, qs, arr ? TorrentMatches(arr, qs) : 0);
+            g_poseArray = arr;
+            if (arr) if (FILE* df = _wfopen((g_dir + L"pose_dump.txt").c_str(), L"w"))
+            {
+                for (int k = 0; k < qs + 40; k++)
+                {
+                    float t[12] = {}; Read(arr + k * 48, t);
+                    fprintf(df, "%d %.4f %.4f %.4f | %.3f %.3f %.3f %.3f | %.2f %.2f %.2f\n", k, t[0], t[1], t[2], t[4], t[5], t[6], t[7], t[8], t[9], t[10]);
+                }
+                fclose(df);
+            }
+            return;
+        }
+    }
+    uintptr_t bag = 0, anim = 0;
+    if (!Read(horse + 0x190, bag) || !Read(bag + 0x28, anim) || !anim) { Log("pose search: no anim module"); return; }
+    std::vector<std::pair<uintptr_t, std::string>> frontier{ { anim, "anim" } }, next;
+    std::vector<uintptr_t> seen{ anim };
+    for (int depth = 0; depth < 4; depth++)
+    {
+        for (auto& [node, path] : frontier)
+            for (uintptr_t o = 0; o < 0x2000 && g_running; o += 8)
+            {
+                uintptr_t p = 0;
+                if (!Read(node + o, p) || p < 0x10000000000ull || p > 0x7FFFFFFFFFFFull || (p & 0xF)) continue;
+                if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+                seen.push_back(p);
+                char childPath[200]; snprintf(childPath, sizeof childPath, "%s[+%llX]", path.c_str(), (unsigned long long)o);
+                int qs = 0; float m[12];
+                while (qs < 2000 && Read(p + qs * 48, m) && LooksQs(m)) qs++;
+                if (qs >= 20) { int hits = TorrentMatches(p, qs); if (hits >= 2) { Log("pose? %s -> %p: %d QS, %d Torrent matches", childPath, (void*)p, qs, hits);
+                    if (hits >= 4)
+                        if (FILE* df = _wfopen((g_dir + L"pose_dump.txt").c_str(), L"w"))
+                        {
+                            for (int k = 0; k < qs + 40; k++)
+                            {
+                                float t[12] = {}; Read(p + k * 48, t);
+                                fprintf(df, "%d %.4f %.4f %.4f | %.3f %.3f %.3f %.3f | %.2f %.2f %.2f\n", k, t[0], t[1], t[2], t[4], t[5], t[6], t[7], t[8], t[9], t[10]);
+                            }
+                            fclose(df);
+                        }
+                } }
+                if (seen.size() < 40000 && depth < 3) next.push_back({ p, childPath });
+            }
+        frontier.swap(next); next.clear();
+    }
+    Log("pose search done (%zu nodes)", seen.size());
+}
+
+static void SearchBoneMatrices(uintptr_t horse)
+{
+    std::vector<std::pair<uintptr_t, std::string>> frontier{ { horse, "chr" } }, next;
+    std::vector<uintptr_t> seen{ horse };
+    int reported = 0;
+    for (int depth = 0; depth < 3 && reported < 20; depth++)
+    {
+        for (auto& [node, path] : frontier)
+        {
+            if (!g_running) break;
+            for (uintptr_t o = 0; o < 0x800; o += 8)
+            {
+                uintptr_t p = 0;
+                if (!Read(node + o, p) || p < 0x10000000000ull || p > 0x7FFFFFFFFFFFull || (p & 0xF)) continue;
+                if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+                seen.push_back(p);
+                char childPath[160]; snprintf(childPath, sizeof childPath, "%s[+%llX]", path.c_str(), (unsigned long long)o);
+                // count consecutive 4x4 affine matrices at p
+                int run = 0, qs = 0, a48 = 0; float m[16];
+                while (run < 2000 && Read(p + run * 64, m) && LooksAffine64(m)) run++;
+                while (qs < 2000 && Read(p + qs * 48, m) && LooksQs(m)) qs++;
+                while (a48 < 2000 && Read(p + a48 * 48, m) && LooksAffine48(m)) a48++;
+                int best = std::max({ run, qs, a48 });
+                if (best >= 60 && reported < 30) { Log("bones? %s -> %p: 4x4 %d, qs %d, 3x4 %d", childPath, (void*)p, run, qs, a48); reported++; }
+                if (qs >= 60)
+                    if (FILE* df = _wfopen((g_dir + L"qs_dump.txt").c_str(), L"a"))
+                    {
+                        fprintf(df, "ARRAY %s %p %d\n", childPath, (void*)p, qs);
+                        for (int k = 0; k < qs; k++) { float t[12]; Read(p + k * 48, t); fprintf(df, "%d %.4f %.4f %.4f\n", k, t[0], t[1], t[2]); }
+                        fclose(df);
+                    }
+                if (seen.size() < 20000) next.push_back({ p, childPath });
+            }
+        }
+        frontier.swap(next); next.clear();
+    }
+    Log("bone search done (%zu nodes visited)", seen.size());
+}
+
+// --- Rocket League sounds, decoded from the player's own Rocket League install ---
+// Nothing from Rocket League ships with the mod: on first launch vgmstream (bundled, ISC license) decodes two
+// sounds from the player's Rocket League banks into a local cache, and the add-on plays them from there.
+#include <mmsystem.h>
+#include <shlobj.h>
+
+struct RlSound { const wchar_t* file; const wchar_t* bank; const char* streamName; };
+static const RlSound kHit{ L"ball_hit.wav", L"SFX_Ball.bnk", "139746051" };
+static const RlSound kGoal{ L"goal.wav", L"SFX_GoalEvent.bnk", "719189024" };
+static std::wstring g_soundDir;
+
+static std::wstring RocketLeagueDir()
+{
+    wchar_t buf[MAX_PATH];
+    if (GetEnvironmentVariableW(L"RADAHN_LEAGUE_RL_DIR", buf, MAX_PATH)) return buf; // set by Melty at launch
+    return L"C:\\Program Files\\Epic Games\\rocketleague";
+}
+
+// Runs vgmstream-cli hidden and returns its stdout
+static std::string RunVgmstream(const std::wstring& args)
+{
+    std::wstring cmd = L"\"" + g_dir + L"vgmstream\\vgmstream-cli.exe\" " + args;
+    SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
+    HANDLE rd, wr; CreatePipe(&rd, &wr, &sa, 0); SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{ sizeof si }; si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE; si.hStdOutput = wr; si.hStdError = wr;
+    PROCESS_INFORMATION pi{};
+    std::string out;
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        CloseHandle(wr); wr = nullptr;
+        char chunk[4096]; DWORD got;
+        while (ReadFile(rd, chunk, sizeof chunk, &got, nullptr) && got) out.append(chunk, got);
+        WaitForSingleObject(pi.hProcess, 30000); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    }
+    if (wr) CloseHandle(wr);
+    CloseHandle(rd);
+    return out;
+}
+
+static bool PrepareSound(const RlSound& s)
+{
+    std::wstring target = g_soundDir + s.file;
+    if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    std::wstring bank = RocketLeagueDir() + L"\\TAGame\\CookedPCConsole\\" + s.bank;
+    if (GetFileAttributesW(bank.c_str()) == INVALID_FILE_ATTRIBUTES) { Log("sound: Rocket League bank not found: %ls", bank.c_str()); return false; }
+    // find the subsong by its Wwise id (robust to the bank's order changing between Rocket League updates)
+    for (int sub = 1; sub <= 64; sub++)
+    {
+        std::string meta = RunVgmstream(L"-m -s " + std::to_wstring(sub) + L" \"" + bank + L"\"");
+        if (meta.find("stream name: ") == std::string::npos) break;
+        if (meta.find(std::string("stream name: ") + s.streamName) == std::string::npos) continue;
+        RunVgmstream(L"-s " + std::to_wstring(sub) + L" -o \"" + target + L"\" \"" + bank + L"\"");
+        bool ok = GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
+        Log("sound: decoded %ls (subsong %d) -> %s", s.file, sub, ok ? "ok" : "failed");
+        return ok;
+    }
+    Log("sound: stream %s not found in %ls", s.streamName, s.bank);
+    return false;
+}
+
+static void PrepareSounds()
+{
+    wchar_t* local = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) { g_soundDir = std::wstring(local) + L"\\RadahnLeague\\sounds\\"; CoTaskMemFree(local); }
+    SHCreateDirectoryExW(nullptr, g_soundDir.c_str(), nullptr);
+    PrepareSound(kHit); PrepareSound(kGoal);
+}
+
+static void PlayRl(const RlSound& s) { PlaySoundW((g_soundDir + s.file).c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT); }
+
 // --- Boost: hold B (controller) or Space (keyboard) while riding ---
 // Torrent's movement comes from his animations, so boosting plays them faster.
 // Animation speed = [[ChrIns+0x190]+0x28]+0x17C8 (float, 1 = normal).
@@ -432,6 +652,7 @@ static DWORD WINAPI MainThread(LPVOID)
     Log("%zu singletons; WorldChrMan static %p, GameDataMan static %p", singletons.size(), (void*)worldChrMan, (void*)gameDataMan);
     g_regulationManager = singletons.count("CSRegulationManager") ? singletons["CSRegulationManager"] : 0;
     FindSpEffectFunctions();
+    PrepareSounds();
     for (int tries = 0; tries < 60 && !FindParamTable(L"SpEffectParam"); tries++) Sleep(500);
     DumpEffectVisuals({ 5232, 415, 416, 460, 1776, 1627, 3160, 1630000, 1632000, 1703000 });
     for (int b : { 2500210, 2500220, 4040170, 4510330, 8110000, 8110001, 8110010, 10611000 }) { int sfx = -1; Read(ParamRow(L"Bullet", b) + 0x04, sfx); Log("bullet %d visual %d", b, sfx); }
@@ -450,6 +671,15 @@ static DWORD WINAPI MainThread(LPVOID)
         { static int curSfx = 0, curDmy = 0; int sfx = 625015, dmy = 900; // Crucible Knight fire breath at the exhaust marker added to the car model
           if (FILE* ff = _wfopen((g_dir + L"boost_fx.txt").c_str(), L"r")) { fscanf(ff, "%d %d", &sfx, &dmy); fclose(ff); }
           if (sfx != curSfx || dmy != curDmy) { SetupBoostFlame(sfx, (short)dmy); curSfx = sfx; curDmy = dmy; } }
+        if (uintptr_t pa = g_poseArray; pa && lastState == 13) { static int tick = 0; if (++tick % 4 == 0) { float a[12], b[12], c[12]; Read(pa + 1 * 48, a); Read(pa + 20 * 48, b); Read(pa + 60 * 48, c); Log("pose sample: [1] q %.3f %.3f %.3f %.3f  [20] q %.3f %.3f %.3f %.3f  [60] t %.3f %.3f %.3f", a[4], a[5], a[6], a[7], b[4], b[5], b[6], b[7], c[0], c[1], c[2]); } }
+        {   // test keys until the ball exists: F9 = ball hit, F10 = goal (only while the game is in front)
+            DWORD fpid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &fpid);
+            static bool f9 = false, f10 = false;
+            bool n9 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F9) & 0x8000), n10 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F10) & 0x8000);
+            if (n9 && !f9) { PlayRl(kHit); Log("played ball hit"); }
+            if (n10 && !f10) { PlayRl(kGoal); Log("played goal"); }
+            f9 = n9; f10 = n10;
+        }
         static int beat = 0; if (++beat % 40 == 0) Log("alive");
         uintptr_t player = 0;                                        // PlayerIns = [[[WorldChrMan]+10EF8]+0]
         Read(Chase(worldChrMan, { 0x10EF8, 0x0 }), player);
@@ -485,7 +715,7 @@ extern "C" __declspec(dllexport) void rl_start(const wchar_t* dir)
 extern "C" __declspec(dllexport) void rl_stop()
 {
     g_running = false;
-    if (g_thread) { WaitForSingleObject(g_thread, 5000); CloseHandle(g_thread); g_thread = nullptr; }
+    if (g_thread) { WaitForSingleObject(g_thread, INFINITE); CloseHandle(g_thread); g_thread = nullptr; }
     if (g_levelThread) { WaitForSingleObject(g_levelThread, 2000); CloseHandle(g_levelThread); g_levelThread = nullptr; }
     if (g_log) { fclose(g_log); g_log = nullptr; }
 }

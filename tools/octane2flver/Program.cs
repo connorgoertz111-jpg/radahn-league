@@ -16,6 +16,29 @@ class Program
 {
     const string Prefix = "octane";
 
+    // Debug: connected pieces of a mesh (by shared vertices) with their bounds, to locate the wheels
+    static void ListPieces(FLVER2.Mesh mesh, string name)
+    {
+        int n = mesh.Vertices.Count;
+        var parent = Enumerable.Range(0, n).ToArray();
+        int Find(int a) { while (parent[a] != a) a = parent[a] = parent[parent[a]]; return a; }
+        var idx = mesh.FaceSets[0].Indices;
+        for (int t = 0; t + 2 < idx.Count; t += 3) { int a = Find(idx[t]), b = Find(idx[t + 1]), c = Find(idx[t + 2]); parent[b] = a; parent[Find(c)] = a; }
+        // vertices that share a position also belong together (UV seams split them)
+        var byPos = new Dictionary<(int, int, int), int>();
+        for (int i = 0; i < n; i++)
+        {
+            var p = mesh.Vertices[i].Position; var key = ((int)MathF.Round(p.X * 1000), (int)MathF.Round(p.Y * 1000), (int)MathF.Round(p.Z * 1000));
+            if (byPos.TryGetValue(key, out int other)) parent[Find(i)] = Find(other); else byPos[key] = i;
+        }
+        var groups = Enumerable.Range(0, n).GroupBy(Find).Where(g => g.Count() > 50).OrderByDescending(g => g.Count());
+        foreach (var g in groups.Take(25))
+        {
+            var ps = g.Select(i => mesh.Vertices[i].Position).ToList();
+            Console.WriteLine($"{name} piece: {g.Count(),5} verts  x {ps.Min(p => p.X),5:F2}..{ps.Max(p => p.X),5:F2}  y {ps.Min(p => p.Y),5:F2}..{ps.Max(p => p.Y),5:F2}  z {ps.Min(p => p.Z),5:F2}..{ps.Max(p => p.Z),5:F2}");
+        }
+    }
+
     static void AddCanopy(FLVER2.Mesh target, List<FLVER2.Mesh> all, Vector3 min, Vector3 max, float radius, int bone, int uvCount, string debugImage)
     {
         const float cell = 0.04f;
@@ -236,6 +259,7 @@ class Program
         int canopyArg = Array.IndexOf(args, "--canopy");
         if (canopyArg >= 0) AddCanopy(meshes[0], meshes, min, max, float.Parse(args[canopyArg + 1], System.Globalization.CultureInfo.InvariantCulture), bone, uvCount, Path.ChangeExtension(outPath, null) + "_canopy.ppm");
 
+        if (Array.IndexOf(args, "--pieces") >= 0) for (int mi = 0; mi < meshes.Count; mi++) ListPieces(meshes[mi], materials[mi].Name);
         // Debug: rear-most geometry (exhaust pipes) in final car space
         foreach (var pm in meshes) { var rear = pm.Vertices.Where(v => v.Position.Z > max.Z - 0.7f && v.Position.Y > 0.3f && v.Position.Y < 1.1f && Math.Abs(v.Position.X) < 0.7f).ToList(); if (rear.Count > 0) foreach (var side in new[] { -1, 1 }) { var s = rear.Where(v => Math.Sign(v.Position.X) == side).ToList(); if (s.Count > 0) Console.WriteLine($"rear side {side}: {s.Count} verts, x {s.Min(v => v.Position.X):F2}..{s.Max(v => v.Position.X):F2} y {s.Min(v => v.Position.Y):F2}..{s.Max(v => v.Position.Y):F2} z {s.Min(v => v.Position.Z):F2}..{s.Max(v => v.Position.Z):F2}"); } }
         fl.Meshes = meshes;
