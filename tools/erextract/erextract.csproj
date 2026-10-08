@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\uxm\UXM\ArchiveKeys.cs" Link="ArchiveKeys.cs" />
+    <Compile Include="..\uxm\UXM\CryptographyUtility.cs" Link="CryptographyUtility.cs" />
+    <PackageReference Include="Portable.BouncyCastle" Version="1.9.0" />
+    <ProjectReference Include="..\sf\SoulsFormats\SoulsFormats.csproj" />
+  </ItemGroup>
+</Project>

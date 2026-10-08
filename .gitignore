@@ -1,0 +1,9 @@
+bin/
+obj/
+*.dcx
+*.bdt
+*.bhd
+*.upk
+*.bnk
+*.wem
+oo2core_*.dll
