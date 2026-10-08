@@ -606,6 +606,108 @@ static void PrepareSounds()
 
 static void PlayRl(const RlSound& s) { PlaySoundW((g_soundDir + s.file).c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT); }
 
+// --- Ball gameplay ---
+// Characters loaded in the open world: [WorldChrMan+0x1E270] set; count at +0x10, array [+0x18] of 16-byte entries
+// (ChrIns pointer first). Each ChrIns: [[+0x190]+0x0] data module with +0x1A2 model id (wide, e.g. L"8101") and
+// +0x138 HP. (Layout per The Grand Archives' "Kill all mobs" script.) Positions: physics module [[+0x190]+0x68]+0x70.
+static uintptr_t g_worldChrMan;
+
+static uintptr_t DataModule(uintptr_t chr) { uintptr_t bag = 0, data = 0; Read(chr + 0x190, bag); if (bag) Read(bag + 0x0, data); return data; }
+static uintptr_t PhysicsModule(uintptr_t chr) { uintptr_t bag = 0, phys = 0; Read(chr + 0x190, bag); if (bag) Read(bag + 0x68, phys); return phys; }
+
+static uintptr_t FindChrByModel(const wchar_t* model)
+{
+    uintptr_t wcm = 0, set = 0, arr = 0; int count = 0;
+    if (!Read(g_worldChrMan, wcm) || !wcm || !Read(wcm + 0x1E270, set) || !set || !Read(set + 0x10, count) || !Read(set + 0x18, arr) || !arr) return 0;
+    for (int i = 0; i < count && i < 4096; i++)
+    {
+        uintptr_t chr = 0; if (!Read(arr + i * 0x10, chr) || !chr) continue;
+        uintptr_t data = DataModule(chr); wchar_t id[5] = {};
+        if (data && Read(data + 0x1A2, id) && wcsncmp(id, model, 4) == 0) return chr;
+    }
+    return 0;
+}
+
+struct BallTuning { float radius = 2.0f, carRadius = 1.6f, kick = 1.6f, minKick = 6.0f, friction = 0.5f, maxSpeed = 45.0f, dmgScale = 3.0f; };
+static BallTuning g_ball;
+static std::atomic<bool> g_ballRunning{ false };
+static HANDLE g_ballThread;
+
+static DWORD WINAPI BallThread(LPVOID)
+{
+    uintptr_t ball = 0, sentinel = 0; float vx = 0, vz = 0;
+    Vec3 lastCar{}; bool haveCar = false; DWORD lastScan = 0, lastHit = 0, lastBossHit = 0;
+    LARGE_INTEGER freq, prev, now; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&prev);
+    while (g_ballRunning)
+    {
+        Sleep(4);
+        QueryPerformanceCounter(&now); float dt = (float)(now.QuadPart - prev.QuadPart) / freq.QuadPart; prev = now;
+        if (dt <= 0 || dt > 0.1f) continue;
+        if (GetTickCount() - lastScan > 2000) // characters stream in and out as you move: rescan now and then
+        {
+            lastScan = GetTickCount();
+            uintptr_t b = FindChrByModel(L"8101"), s = FindChrByModel(L"3251");
+            if (b != ball) { Log(b ? "ball found %p" : "ball unloaded", (void*)b); ball = b; vx = vz = 0; }
+            if (s != sentinel) { Log(s ? "Tree Sentinel found %p" : "Tree Sentinel unloaded", (void*)s); sentinel = s; }
+        }
+        uintptr_t phys = ball ? PhysicsModule(ball) : 0;
+        Vec3 bp{}; if (!phys || !Read(phys + 0x70, bp)) continue;
+        if (uintptr_t data = DataModule(ball)) { int hp = 0, maxHp = 0; Read(data + 0x138, hp); Read(data + 0x13C, maxHp); if (maxHp > 0 && hp < maxHp) *(volatile int*)(data + 0x138) = maxHp; } // indestructible
+
+        // Car velocity from Torrent's movement
+        uintptr_t horse = g_levelHorse; Vec3 car{}; float cvx = 0, cvz = 0;
+        if (horse && ChrPosition(horse, car)) { if (haveCar) { cvx = (car.x - lastCar.x) / dt; cvz = (car.z - lastCar.z) / dt; } lastCar = car; haveCar = true; }
+        else haveCar = false;
+
+        // Kick: car touches the ball
+        if (haveCar)
+        {
+            float dx = bp.x - car.x, dz = bp.z - car.z, dist = sqrtf(dx * dx + dz * dz);
+            if (dist < g_ball.radius + g_ball.carRadius && fabsf(bp.y - car.y) < 3 && GetTickCount() - lastHit > 250)
+            {
+                float nx = dist > 0.01f ? dx / dist : 1, nz = dist > 0.01f ? dz / dist : 0;
+                float carSpeed = sqrtf(cvx * cvx + cvz * cvz);
+                float push = std::max(g_ball.minKick, carSpeed * g_ball.kick);
+                vx = nx * push * 0.6f + cvx * g_ball.kick * 0.4f; vz = nz * push * 0.6f + cvz * g_ball.kick * 0.4f;
+                lastHit = GetTickCount(); PlayRl(kHit);
+                Log("kick: car %.1f m/s -> ball %.1f m/s", carSpeed, sqrtf(vx * vx + vz * vz));
+            }
+        }
+
+        // Roll: move along the ground (the game's own physics keeps the ball on the terrain), with friction
+        float speed = sqrtf(vx * vx + vz * vz);
+        if (speed > g_ball.maxSpeed) { vx *= g_ball.maxSpeed / speed; vz *= g_ball.maxSpeed / speed; speed = g_ball.maxSpeed; }
+        if (speed > 0.05f)
+        {
+            Vec3 np = bp; np.x += vx * dt; np.z += vz * dt;
+            *(volatile float*)(phys + 0x70) = np.x; *(volatile float*)(phys + 0x78) = np.z;
+            float decay = expf(-g_ball.friction * dt); vx *= decay; vz *= decay;
+        }
+        else vx = vz = 0;
+
+        // Damage: a moving ball hitting Tree Sentinel
+        Vec3 sp{};
+        if (sentinel && speed > 4 && ChrPosition(sentinel, sp) && GetTickCount() - lastBossHit > 800)
+        {
+            float dx = sp.x - bp.x, dz = sp.z - bp.z;
+            if (dx * dx + dz * dz < (g_ball.radius + 2.0f) * (g_ball.radius + 2.0f) && fabsf(sp.y - bp.y) < 4)
+            {
+                uintptr_t data = DataModule(sentinel); int hp = 0;
+                if (data && Read(data + 0x138, hp) && hp > 0)
+                {
+                    int dmg = (int)(powf(speed, 1.5f) * g_ball.dmgScale);
+                    int left = std::max(0, hp - dmg);
+                    *(volatile int*)(data + 0x138) = left;
+                    lastBossHit = GetTickCount(); PlayRl(left == 0 ? kGoal : kHit);
+                    Log("ball hit Tree Sentinel at %.1f m/s: %d damage (%d -> %d)", speed, dmg, hp, left);
+                    vx = -vx * 0.5f; vz = -vz * 0.5f; // bounce off
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 // --- Boost: hold B (controller) or Space (keyboard) while riding ---
 // Torrent's movement comes from his animations, so boosting plays them faster.
 // Animation speed = [[ChrIns+0x190]+0x28]+0x17C8 (float, 1 = normal).
@@ -680,6 +782,8 @@ static DWORD WINAPI MainThread(LPVOID)
     g_regulationManager = singletons.count("CSRegulationManager") ? singletons["CSRegulationManager"] : 0;
     FindSpEffectFunctions();
     FindBulletSpawn(singletons);
+    g_worldChrMan = worldChrMan;
+    g_ballRunning = true; g_ballThread = CreateThread(nullptr, 0, BallThread, nullptr, 0, nullptr);
     PrepareSounds();
     for (int tries = 0; tries < 60 && !FindParamTable(L"SpEffectParam"); tries++) Sleep(500);
     DumpEffectVisuals({ 5232, 415, 416, 460, 1776, 1627, 3160, 1630000, 1632000, 1703000 });
@@ -748,6 +852,7 @@ extern "C" __declspec(dllexport) void rl_stop()
     g_running = false;
     if (g_thread) { WaitForSingleObject(g_thread, INFINITE); CloseHandle(g_thread); g_thread = nullptr; }
     if (g_levelThread) { WaitForSingleObject(g_levelThread, 2000); CloseHandle(g_levelThread); g_levelThread = nullptr; }
+    g_ballRunning = false; if (g_ballThread) { WaitForSingleObject(g_ballThread, INFINITE); CloseHandle(g_ballThread); g_ballThread = nullptr; }
     if (g_log) { fclose(g_log); g_log = nullptr; }
 }
 
