@@ -35,6 +35,25 @@ class Program
             foreach (var m in fl.Meshes) Console.WriteLine($"mesh mat={m.MaterialIndex} verts={m.Vertices.Count} defbone={m.DefaultBoneIndex} dyn={m.Dynamic} bones=[{string.Join(",", m.BoneIndices.Take(8))}]");
             for (int bi = 0; bi < fl.Bones.Count; bi++) { var b = fl.Bones[bi]; Console.WriteLine($"bone {bi} {b.Name} parent={b.ParentIndex} rot={b.Rotation} box={(b.BoundingBoxMin.X <= b.BoundingBoxMax.X ? "yes" : "empty")}"); }
             foreach (var l in fl.BufferLayouts) Console.WriteLine("layout " + string.Join(" ", l.Select(s => $"{s.Semantic}:{s.Type}")));
+            foreach (var d in fl.Dummies) Console.WriteLine($"dummy ref={d.ReferenceID} pos={d.Position} parent={(d.ParentBoneIndex >= 0 ? fl.Bones[d.ParentBoneIndex].Name : "-")} attach={(d.AttachBoneIndex >= 0 ? fl.Bones[d.AttachBoneIndex].Name : "-")}");
+            return 0;
+        }
+        if (args.Length == 5 && args[0] == "dummy")
+        {
+            // dummy <in.chrbnd.dcx> <out.chrbnd.dcx> <referenceId> <dy>: move every dummy with that reference ID vertically
+            var bnd = BND4.Read(args[1]);
+            var file = bnd.Files.First(f => f.Name.EndsWith(".flver", StringComparison.OrdinalIgnoreCase));
+            var fl = FLVER2.Read(file.Bytes);
+            short refId = short.Parse(args[3]); float dy = float.Parse(args[4], System.Globalization.CultureInfo.InvariantCulture);
+            foreach (var d in fl.Dummies.Where(d => d.ReferenceID == refId))
+            {
+                var before = d.Position;
+                d.Position += new System.Numerics.Vector3(0, dy, 0);
+                Console.WriteLine($"dummy {refId}: {before} -> {d.Position}");
+            }
+            file.Bytes = fl.Write();
+            Directory.CreateDirectory(Path.GetDirectoryName(args[2]));
+            bnd.Write(args[2]);
             return 0;
         }
         if (args.Length == 2 && args[0] == "tpf")

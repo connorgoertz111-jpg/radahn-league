@@ -27,8 +27,12 @@ class Program
         var flverFile = bnd.Files.First(f => f.Name.EndsWith(".flver", StringComparison.OrdinalIgnoreCase));
         string chrId = Path.GetFileNameWithoutExtension(flverFile.Name);
         var fl = FLVER2.Read(flverFile.Bytes);
-        var template = fl.Meshes[0];
-        var templateMat = fl.Materials[template.MaterialIndex];
+        // --mat <name>: base the car's materials on a named template material (e.g. a plain shader instead of fur)
+        int matArg = Array.IndexOf(args, "--mat");
+        int templateMatIndex = matArg >= 0 ? fl.Materials.FindIndex(m => m.Name == args[matArg + 1]) : fl.Meshes[0].MaterialIndex;
+        var template = fl.Meshes.First(m => m.MaterialIndex == templateMatIndex);
+        var templateMat = fl.Materials[templateMatIndex];
+        Console.WriteLine($"template material '{templateMat.Name}' {templateMat.MTD}");
         Console.WriteLine($"template {chrId} bbox {fl.Header.BoundingBoxMin} .. {fl.Header.BoundingBoxMax}, facesets {template.FaceSets.Count}");
 
         var scene = new AssimpContext().ImportFile(fbxPath,
@@ -37,7 +41,9 @@ class Program
 
         // Assimp hands back Y-up with the car's length on X. Elden Ring is Y-up and left-handed with forward on Z:
         // swapping X and Z both turns the car and mirrors it into left-handed space, so flip winding.
-        static Vector3 Conv(Vector3D v) => new Vector3(v.Z, v.Y, v.X);
+        // --reverse turns the model 180° around the vertical axis (a rotation, so winding is unaffected)
+        bool reverse = Array.IndexOf(args, "--reverse") >= 0;
+        Vector3 Conv(Vector3D v) => reverse ? new Vector3(-v.Z, v.Y, -v.X) : new Vector3(v.Z, v.Y, v.X);
 
         // Overall bounds for scaling/centering across every part
         var all = scene.Meshes.SelectMany(m => m.Vertices).Select(Conv).ToList();
@@ -120,6 +126,9 @@ class Program
         fl.Bones[bone].BoundingBoxMin = min; fl.Bones[bone].BoundingBoxMax = max;
 
         flverFile.Bytes = fl.Write();
+        // Cloth simulation (e.g. Torrent's mane) targets meshes that no longer exist: drop it
+        int dropped = bnd.Files.RemoveAll(f => f.Name.EndsWith("_c.hkx", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".clm2", StringComparison.OrdinalIgnoreCase));
+        if (dropped > 0) Console.WriteLine($"dropped {dropped} cloth file(s)");
         Directory.CreateDirectory(Path.GetDirectoryName(outPath));
         bnd.Write(outPath);
         Console.WriteLine($"wrote {outPath} ({new FileInfo(outPath).Length} bytes), bone {bone} {fl.Bones[bone].Name}");
@@ -139,7 +148,8 @@ class Program
                 Console.WriteLine($"texture {name} format {format}");
             }
             tpfFile.Bytes = tpf.Write();
-            tpfFile.Name = $@"N:\GR\data\INTERROOT_win64\chr\{chrId}\{chrId}_h.tpf";
+            string tpfName = Path.GetFileName(texOut).Split('.')[0]; // e.g. c8002_l from c8002_l.texbnd.dcx
+            tpfFile.Name = $@"N:\GR\data\INTERROOT_win64\chr\{chrId}\{tpfName}.tpf";
             texbnd.Files = new List<BinderFile> { tpfFile };
             texbnd.Write(texOut);
             Console.WriteLine($"wrote {texOut} ({new FileInfo(texOut).Length} bytes)");
