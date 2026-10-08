@@ -138,6 +138,63 @@ static void SetHidden(uintptr_t player, bool hidden)
     Log(hidden ? "hid player" : "showed player");
 }
 
+// --- Camera: pull the chase camera back and widen the view ---
+// Game params live in memory under CSRegulationManager. Layout (community-documented):
+//   manager +0x18/+0x20 = begin/end of ParamResCap*; ParamResCap +0x18 = wide-string name (DLWString),
+//   +0x80 = header, header +0x80 = table; table +0x0A = row count (u16), +0x40 = rows of {id, dataOffset, end} (24 bytes).
+// LockCamParam rows: +0x00 camDistTarget, +0x14 camFovY (degrees).
+static uintptr_t g_regulationManager;
+
+static uintptr_t FindParamTable(const wchar_t* wanted)
+{
+    uintptr_t rm = 0, it = 0, end = 0;
+    if (!Read(g_regulationManager, rm) || !rm || !Read(rm + 0x18, it) || !Read(rm + 0x20, end)) return 0;
+    for (; it && it < end; it += 8)
+    {
+        uintptr_t cap = 0; if (!Read(it, cap) || !cap) continue;
+        uint64_t len = 0, capacity = 0; Read(cap + 0x18 + 0x10, len); Read(cap + 0x18 + 0x18, capacity);
+        uintptr_t chars = cap + 0x18; if (capacity > 7) Read(cap + 0x18, chars);
+        wchar_t name[64] = {}; if (len >= 64) continue;
+        SIZE_T got = 0; ReadProcessMemory(GetCurrentProcess(), (void*)chars, name, len * sizeof(wchar_t), &got);
+        if (wcscmp(name, wanted) != 0) continue;
+        uintptr_t header = 0, table = 0;
+        if (Read(cap + 0x80, header) && header && Read(header + 0x80, table)) return table;
+    }
+    return 0;
+}
+
+struct CamRow { uintptr_t row; float dist, fov; };
+static std::vector<CamRow> g_camOriginal;
+
+static bool ApplyCamera(float distMult, float fov)
+{
+    if (g_camOriginal.empty())
+    {
+        uintptr_t t = FindParamTable(L"LockCamParam");
+        uint16_t rows = 0; if (!t || !Read(t + 0x0A, rows) || !rows) return false; // params not loaded yet (early in startup): retry later
+        for (int i = 0; i < rows; i++)
+        {
+            uint64_t off = 0; if (!Read(t + 0x40 + i * 24 + 8, off)) continue;
+            CamRow r{ t + off }; Read(r.row + 0x00, r.dist); Read(r.row + 0x14, r.fov);
+            g_camOriginal.push_back(r);
+        }
+        Log("LockCamParam: %zu rows (first: dist %.2f fov %.1f)", g_camOriginal.size(), g_camOriginal.empty() ? 0.f : g_camOriginal[0].dist, g_camOriginal.empty() ? 0.f : g_camOriginal[0].fov);
+    }
+    for (auto& r : g_camOriginal)
+    {
+        *(volatile float*)(r.row + 0x00) = r.dist * distMult;
+        *(volatile float*)(r.row + 0x14) = fov > 0 ? fov : r.fov;
+    }
+    Log("camera: distance x%.2f, fov %.1f", distMult, fov);
+    return true;
+}
+
+static void RestoreCamera()
+{
+    for (auto& r : g_camOriginal) { *(volatile float*)(r.row + 0x00) = r.dist; *(volatile float*)(r.row + 0x14) = r.fov; }
+    g_camOriginal.clear();
+}
+
 static DWORD WINAPI MainThread(LPVOID)
 {
     Log("core started");
@@ -146,12 +203,19 @@ static DWORD WINAPI MainThread(LPVOID)
     uintptr_t worldChrMan = singletons.count("WorldChrMan") ? singletons["WorldChrMan"] : 0;
     uintptr_t gameDataMan = StaticFromPattern("48 8B 05 ?? ?? ?? ?? 48 85 C0 74 05 48 8B 40 58 C3 C3");
     Log("%zu singletons; WorldChrMan static %p, GameDataMan static %p", singletons.size(), (void*)worldChrMan, (void*)gameDataMan);
+    g_regulationManager = singletons.count("CSRegulationManager") ? singletons["CSRegulationManager"] : 0;
 
     int lastState = -12345;
     uintptr_t lastPlayer = 1;
     while (g_running)
     {
-        Sleep(250);        static int beat = 0; if (++beat % 40 == 0) Log("alive");
+        Sleep(250);        {
+            // camera.txt next to the DLL: "<distance multiplier> <fov degrees>" (re-read live for tuning)
+            static float curMult = -1, curFov = -1; float mult = 2.4f, fov = 60.0f;
+            if (FILE* cf = _wfopen((g_dir + L"camera.txt").c_str(), L"r")) { fscanf(cf, "%f %f", &mult, &fov); fclose(cf); }
+            if ((mult != curMult || fov != curFov) && ApplyCamera(mult, fov)) { curMult = mult; curFov = fov; }
+        }
+        static int beat = 0; if (++beat % 40 == 0) Log("alive");
         uintptr_t player = 0;                                        // PlayerIns = [[[WorldChrMan]+10EF8]+0]
         Read(Chase(worldChrMan, { 0x10EF8, 0x0 }), player);
         uintptr_t ride = Chase(gameDataMan, { 0x8, 0x8E0, 0x0 });   // RideGameData = [[[GameDataMan]+8]+8E0]
@@ -167,6 +231,7 @@ static DWORD WINAPI MainThread(LPVOID)
         }
     }
     if (lastState == 13) SetHidden(lastPlayer, false); // never leave the player invisible after unloading
+    RestoreCamera();
     Log("core stopped");
     return 0;
 }

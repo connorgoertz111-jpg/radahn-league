@@ -16,6 +16,116 @@ class Program
 {
     const string Prefix = "octane";
 
+    static void AddCanopy(FLVER2.Mesh target, List<FLVER2.Mesh> all, Vector3 min, Vector3 max, float radius, int bone, int uvCount, string debugImage)
+    {
+        const float cell = 0.04f;
+        int nx = (int)((max.X - min.X) / cell) + 1, nz = (int)((max.Z - min.Z) / cell) + 1;
+        var h = new float[nx, nz];
+        for (int i = 0; i < nx; i++) for (int j = 0; j < nz; j++) h[i, j] = float.NegativeInfinity;
+
+        // Top surface: highest point of any triangle over each cell (sample triangles densely)
+        foreach (var m in all)
+        {
+            var idx = m.FaceSets[0].Indices;
+            for (int t = 0; t + 2 < idx.Count; t += 3)
+            {
+                Vector3 a = m.Vertices[idx[t]].Position, b = m.Vertices[idx[t + 1]].Position, c = m.Vertices[idx[t + 2]].Position;
+                float longest = Math.Max(Vector3.Distance(a, b), Math.Max(Vector3.Distance(b, c), Vector3.Distance(a, c)));
+                int steps = Math.Max(1, (int)(longest / (cell * 0.5f)));
+                for (int u = 0; u <= steps; u++)
+                    for (int v = 0; v <= steps - u; v++)
+                    {
+                        var p = a + (b - a) * (u / (float)steps) + (c - a) * (v / (float)steps);
+                        int i = (int)((p.X - min.X) / cell), j = (int)((p.Z - min.Z) / cell);
+                        if (i >= 0 && i < nx && j >= 0 && j < nz && p.Y > h[i, j]) h[i, j] = p.Y;
+                    }
+            }
+        }
+
+        // Morphological closing with a disc: dilate (max) then erode (min). Undefined cells stay undefined.
+        int r = (int)(radius / cell);
+        float[,] Filter(float[,] src, bool dilate)
+        {
+            var dst = new float[nx, nz];
+            for (int i = 0; i < nx; i++)
+                for (int j = 0; j < nz; j++)
+                {
+                    if (float.IsNegativeInfinity(h[i, j])) { dst[i, j] = float.NegativeInfinity; continue; }
+                    float best = dilate ? float.NegativeInfinity : float.PositiveInfinity;
+                    for (int di = -r; di <= r; di++)
+                        for (int dj = -r; dj <= r; dj++)
+                        {
+                            if (di * di + dj * dj > r * r) continue;
+                            int a = i + di, b = j + dj;
+                            if (a < 0 || a >= nx || b < 0 || b >= nz || float.IsNegativeInfinity(src[a, b])) continue;
+                            best = dilate ? Math.Max(best, src[a, b]) : Math.Min(best, src[a, b]);
+                        }
+                    dst[i, j] = best;
+                }
+            return dst;
+        }
+        // Centerline profile (debug): height along the car's length at x = 0
+        int mid = (int)((0 - min.X) / cell);
+        for (int j = 0; j < nz; j += 4)
+        {
+            var row = Enumerable.Range(-12, 25).Select(d => mid + d * 2).Where(i => i >= 0 && i < nx).Select(i => float.IsNegativeInfinity(h[i, j]) ? "  .  " : $"{h[i, j],5:F2}");
+            Console.WriteLine($"z {min.Z + j * cell,6:F2}: {string.Join(" ", row)}");
+        }
+        var closed = Filter(Filter(h, true), false);
+
+        // Lid cells: the closing raised the surface noticeably (a hollow such as the open cabin)
+        var lid = new bool[nx, nz];
+        int count = 0;
+        for (int i = 0; i < nx; i++)
+            for (int j = 0; j < nz; j++)
+                if (!float.IsNegativeInfinity(h[i, j]) && closed[i, j] - h[i, j] > 0.08f) { lid[i, j] = true; count++; }
+        Console.WriteLine($"canopy: grid {nx}x{nz}, radius {radius} m, {count} lid cells");
+
+        // Debug image (top view): grey = car height, red = lid
+        float lo = min.Y, hi = max.Y;
+        using (var f = new StreamWriter(debugImage))
+        {
+            f.Write($"P3\n{nx} {nz}\n255\n");
+            for (int j = nz - 1; j >= 0; j--)
+            {
+                for (int i = 0; i < nx; i++)
+                {
+                    int g = float.IsNegativeInfinity(h[i, j]) ? 0 : (int)(40 + 200 * (h[i, j] - lo) / (hi - lo));
+                    f.Write(lid[i, j] ? $"230 40 40 " : $"{g} {g} {g} ");
+                }
+                f.Write('\n');
+            }
+        }
+
+        // Lid mesh: one vertex per lid cell corner at the closed height, quads between lid cells
+        var vertIndex = new Dictionary<(int, int), int>();
+        int V(int i, int j)
+        {
+            if (vertIndex.TryGetValue((i, j), out int k)) return k;
+            int ci = Math.Clamp(i, 0, nx - 1), cj = Math.Clamp(j, 0, nz - 1);
+            float y = closed[ci, cj];
+            var v = new FLVER.Vertex(uvCount * 2, 1, 1);
+            v.Position = new Vector3(min.X + i * cell, y, min.Z + j * cell);
+            v.Normal = Vector3.UnitY; v.NormalW = 127;
+            v.Tangents.Add(new Vector4(1, 0, 0, 1));
+            v.BoneIndices[0] = bone; v.BoneWeights[0] = 1;
+            v.Colors.Add(new FLVER.VertexColor(1f, 1f, 1f, 1f));
+            for (int q = 0; q < uvCount * 2; q++) v.UVs.Add(new Vector3(0.5f, 0.5f, 0));
+            target.Vertices.Add(v);
+            return vertIndex[(i, j)] = target.Vertices.Count - 1;
+        }
+        var lidIdx = new List<int>();
+        for (int i = 0; i < nx - 1; i++)
+            for (int j = 0; j < nz - 1; j++)
+            {
+                if (!lid[i, j]) continue;
+                int a = V(i, j), b = V(i + 1, j), c = V(i + 1, j + 1), d = V(i, j + 1);
+                lidIdx.AddRange(new[] { a, c, b, a, d, c });
+            }
+        foreach (var fs in target.FaceSets) fs.Indices.AddRange(lidIdx);
+        Console.WriteLine($"canopy: added {vertIndex.Count} verts, {lidIdx.Count / 3} tris");
+    }
+
     static int Main(string[] args)
     {
         string templatePath = args[0], fbxPath = args[1], outPath = args[2];
@@ -120,6 +230,11 @@ class Program
             meshes.Add(mesh);
             Console.WriteLine($"part '{matName}': {verts.Count} verts, {idx.Count / 3} tris");
         }
+
+        // --canopy <radiusMeters>: the model has an open cabin (no glass). Build a top-down height map of the whole car,
+        // fill hollows with a morphological closing (dilate then erode), and add a lid wherever that raised the surface.
+        int canopyArg = Array.IndexOf(args, "--canopy");
+        if (canopyArg >= 0) AddCanopy(meshes[0], meshes, min, max, float.Parse(args[canopyArg + 1], System.Globalization.CultureInfo.InvariantCulture), bone, uvCount, Path.ChangeExtension(outPath, null) + "_canopy.ppm");
 
         fl.Meshes = meshes;
         fl.Materials = materials;
