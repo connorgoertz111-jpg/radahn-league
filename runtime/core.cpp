@@ -195,11 +195,11 @@ static void DumpEffectVisuals(std::initializer_list<int> ids)
 // that no other effect references, so nothing else in the game changes. sfx/dummy are overridable via boost_fx.txt.
 static int g_flameVfxRow = -1;
 
-static void SetupBoostFlame(int sfxId, short dummyId)
+static bool SetupBoostFlame(int sfxId, short dummyId)
 {
     uintptr_t spTable = FindParamTable(L"SpEffectParam"), vfxTable = FindParamTable(L"SpEffectVfxParam");
     uint16_t spRows = 0, vfxRows = 0;
-    if (!spTable || !vfxTable || !Read(spTable + 0x0A, spRows) || !Read(vfxTable + 0x0A, vfxRows)) return;
+    if (!spTable || !vfxTable || !Read(spTable + 0x0A, spRows) || !Read(vfxTable + 0x0A, vfxRows) || !spRows || !vfxRows) return false; // params not loaded yet: retry
     if (g_flameVfxRow < 0)
     {
         std::vector<int> used;
@@ -217,11 +217,12 @@ static void SetupBoostFlame(int sfxId, short dummyId)
         Log("boost flame: using free visual row %d", g_flameVfxRow);
     }
     uintptr_t vfx = ParamRow(L"SpEffectVfxParam", g_flameVfxRow), sp = ParamRow(L"SpEffectParam", 5232);
-    if (!vfx || !sp) return;
+    if (!vfx || !sp) return false;
     *(volatile int*)(vfx + 0x00) = sfxId;     // midstSfxId: looping visual while active
     *(volatile short*)(vfx + 0x24) = dummyId; // midstDmyId: marker it is pinned to
     *(volatile int*)(sp + 0x170) = g_flameVfxRow;
     Log("boost flame: effect 5232 -> visual row %d, sfx %d at marker %d", g_flameVfxRow, sfxId, dummyId);
+    return true;
 }
 
 struct CamRow { uintptr_t row; float dist, fov; };
@@ -606,6 +607,42 @@ static void PrepareSounds()
 
 static void PlayRl(const RlSound& s) { PlaySoundW((g_soundDir + s.file).c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT); }
 
+// --- Event flags (algorithm as documented by The Grand Archives' EventFlag helpers) ---
+// CSFD4VirtualMemoryFlag: +0x1C divisor, +0x20 block size, +0x28 block array, +0x38 tree (std::map: head +0x8 = root;
+// node +0x0 left, +0x10 right, +0x19 isNil, +0x20 block id, +0x28 mode, +0x30 address/index). Bits are big-endian.
+static uintptr_t g_eventFlagMan;
+
+static bool FlagBit(uint32_t id, uintptr_t& byteAddr, uint8_t& mask)
+{
+    uintptr_t vm = 0; if (!Read(g_eventFlagMan, vm) || !vm) return false;
+    int mod = 0; if (!Read(vm + 0x1C, mod) || mod <= 0) return false;
+    uint32_t block = id / mod, index = id - block * mod;
+    uintptr_t tree = 0, node = 0; if (!Read(vm + 0x38, tree) || !tree || !Read(tree + 0x8, node)) return false;
+    for (int guard = 0; guard < 64; guard++)
+    {
+        uint8_t isNil = 1; if (!Read(node + 0x19, isNil) || isNil) return false;
+        uint32_t nb = 0; Read(node + 0x20, nb);
+        if (nb == block) break;
+        if (!Read(node + (nb < block ? 0x10 : 0x0), node) || !node) return false;
+    }
+    int mode = 0; uintptr_t addr = 0; Read(node + 0x28, mode); Read(node + 0x30, addr);
+    if (mode == 1) { int size = 0; uintptr_t blocks = 0; Read(vm + 0x20, size); Read(vm + 0x28, blocks); addr = blocks + (addr & 0xFFFFFFFF) * size; }
+    else if (mode != 2 || !addr) return false;
+    byteAddr = addr + index / 8; mask = (uint8_t)(1 << (7 - index % 8));
+    return true;
+}
+
+static int GetFlag(uint32_t id) { uintptr_t a; uint8_t m, v; return FlagBit(id, a, m) && Read(a, v) ? ((v & m) != 0) : -1; }
+static bool SetFlag(uint32_t id, bool on)
+{
+    uintptr_t a; uint8_t m, v;
+    if (!FlagBit(id, a, m) || !Read(a, v)) return false;
+    *(volatile uint8_t*)a = on ? (v | m) : (v & ~m);
+    return true;
+}
+
+constexpr uint32_t kTreeSentinelDefeated = 1042360800; // Limgrave Tree Sentinel "defeated"
+
 // --- Ball gameplay ---
 // Characters loaded in the open world: [WorldChrMan+0x1E270] set; count at +0x10, array [+0x18] of 16-byte entries
 // (ChrIns pointer first). Each ChrIns: [[+0x190]+0x0] data module with +0x1A2 model id (wide, e.g. L"8101") and
@@ -628,7 +665,7 @@ static uintptr_t FindChrByModel(const wchar_t* model)
     return 0;
 }
 
-struct BallTuning { float radius = 2.0f, carRadius = 1.6f, kick = 1.6f, minKick = 6.0f, friction = 0.5f, maxSpeed = 45.0f, dmgScale = 3.0f; };
+struct BallTuning { float radius = 2.0f, carRadius = 1.6f, kick = 1.1f, minKick = 5.0f, friction = 1.1f, maxSpeed = 25.0f, dmgScale = 6.0f, arena = 45.0f, maxSlope = 0.6f; };
 static BallTuning g_ball;
 static std::atomic<bool> g_ballRunning{ false };
 static HANDLE g_ballThread;
@@ -636,6 +673,7 @@ static HANDLE g_ballThread;
 static DWORD WINAPI BallThread(LPVOID)
 {
     uintptr_t ball = 0, sentinel = 0; float vx = 0, vz = 0;
+    Vec3 home{}; bool haveHome = false; // arena center: where the ball first appeared
     Vec3 lastCar{}; bool haveCar = false; DWORD lastScan = 0, lastHit = 0, lastBossHit = 0;
     LARGE_INTEGER freq, prev, now; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&prev);
     while (g_ballRunning)
@@ -647,17 +685,42 @@ static DWORD WINAPI BallThread(LPVOID)
         {
             lastScan = GetTickCount();
             uintptr_t b = FindChrByModel(L"8101"), s = FindChrByModel(L"3251");
-            if (b != ball) { Log(b ? "ball found %p" : "ball unloaded", (void*)b); ball = b; vx = vz = 0; }
+            if (b != ball) { Log(b ? "ball found %p" : "ball unloaded", (void*)b); ball = b; vx = vz = 0; haveHome = false; }
+            // live tuning: ball.txt = "kick friction maxSpeed dmgScale arena"
+            if (FILE* tf = _wfopen((g_dir + L"ball.txt").c_str(), L"r")) { fscanf(tf, "%f %f %f %f %f", &g_ball.kick, &g_ball.friction, &g_ball.maxSpeed, &g_ball.dmgScale, &g_ball.arena); fclose(tf); }
             if (s != sentinel) { Log(s ? "Tree Sentinel found %p" : "Tree Sentinel unloaded", (void*)s); sentinel = s; }
+            if (sentinel) { int hp = -1, mhp = -1; uintptr_t d = DataModule(sentinel); Read(d + 0x138, hp); Read(d + 0x13C, mhp); Vec3 sp{}, bp0{}; ChrPosition(sentinel, sp); if (ball) ChrPosition(ball, bp0); static int lastHp = -2; if (hp != lastHp) { Log("Tree Sentinel HP %d / %d at %.1f %.1f %.1f (ball %.1f m away)", hp, mhp, sp.x, sp.y, sp.z, sqrtf((sp.x - bp0.x) * (sp.x - bp0.x) + (sp.z - bp0.z) * (sp.z - bp0.z))); lastHp = hp; } }
         }
         uintptr_t phys = ball ? PhysicsModule(ball) : 0;
         Vec3 bp{}; if (!phys || !Read(phys + 0x70, bp)) continue;
+        if (!haveHome)
+        {
+            // Arena center: Tree Sentinel where he was first seen (his post); fall back to the ball
+            Vec3 sp0{}; home = (sentinel && ChrPosition(sentinel, sp0)) ? sp0 : bp; haveHome = true;
+            Log("arena center %.1f %.1f %.1f, radius %.0f m", home.x, home.y, home.z, g_ball.arena);
+        }
+        {   // F7: put the ball back in the middle of the arena
+            static bool f7 = false; DWORD fpid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &fpid);
+            bool n7 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F7) & 0x8000);
+            if (n7 && !f7) { *(volatile float*)(phys + 0x70) = home.x + 8; *(volatile float*)(phys + 0x74) = home.y + 3; *(volatile float*)(phys + 0x78) = home.z; vx = vz = 0; f7 = n7; Log("ball reset"); continue; }
+            f7 = n7;
+        }
         if (uintptr_t data = DataModule(ball)) { int hp = 0, maxHp = 0; Read(data + 0x138, hp); Read(data + 0x13C, maxHp); if (maxHp > 0 && hp < maxHp) *(volatile int*)(data + 0x138) = maxHp; } // indestructible
 
         // Car velocity from Torrent's movement
         uintptr_t horse = g_levelHorse; Vec3 car{}; float cvx = 0, cvz = 0;
-        if (horse && ChrPosition(horse, car)) { if (haveCar) { cvx = (car.x - lastCar.x) / dt; cvz = (car.z - lastCar.z) / dt; } lastCar = car; haveCar = true; }
-        else haveCar = false;
+        // Measured per 4 ms tick the position is jumpy, so smooth over ~150 ms and ignore teleport-sized jumps
+        static float svx = 0, svz = 0;
+        if (horse && ChrPosition(horse, car))
+        {
+            if (haveCar)
+            {
+                float ix = (car.x - lastCar.x) / dt, iz = (car.z - lastCar.z) / dt;
+                if (ix * ix + iz * iz < 60 * 60) { float a = std::min(1.0f, dt / 0.15f); svx += (ix - svx) * a; svz += (iz - svz) * a; }
+            }
+            lastCar = car; haveCar = true; cvx = svx; cvz = svz;
+        }
+        else { haveCar = false; svx = svz = 0; }
 
         // Kick: car touches the ball
         if (haveCar)
@@ -680,6 +743,22 @@ static DWORD WINAPI BallThread(LPVOID)
         if (speed > 0.05f)
         {
             Vec3 np = bp; np.x += vx * dt; np.z += vz * dt;
+            // Arena wall: reflect off the circle around the start point
+            float ox = np.x - home.x, oz = np.z - home.z, od = sqrtf(ox * ox + oz * oz);
+            if (od > g_ball.arena)
+            {
+                float nx = ox / od, nz = oz / od, dot = vx * nx + vz * nz;
+                if (dot > 0) { vx -= 1.6f * dot * nx; vz -= 1.6f * dot * nz; }
+                np.x = home.x + nx * g_ball.arena; np.z = home.z + nz * g_ball.arena;
+            }
+            // Steep ground: if the last step climbed faster than the slope limit, bounce back instead of burrowing in
+            static Vec3 prevBp{}; static bool havePrev = false;
+            if (havePrev)
+            {
+                float run = sqrtf((bp.x - prevBp.x) * (bp.x - prevBp.x) + (bp.z - prevBp.z) * (bp.z - prevBp.z));
+                if (run > 0.02f && (bp.y - prevBp.y) / run > g_ball.maxSlope) { vx = -vx * 0.5f; vz = -vz * 0.5f; np.x = prevBp.x; np.z = prevBp.z; }
+            }
+            prevBp = bp; havePrev = true;
             *(volatile float*)(phys + 0x70) = np.x; *(volatile float*)(phys + 0x78) = np.z;
             float decay = expf(-g_ball.friction * dt); vx *= decay; vz *= decay;
         }
@@ -755,13 +834,16 @@ static DWORD WINAPI LevelThread(LPVOID)
         }
         static uintptr_t boostedHorse = 0;
         bool boost = horse && BoostHeld();
-        static uintptr_t fxHorse = 0; static int fxId = 0;
-        if (boost != g_boosting)
+        // Speed follows B instantly; the flame effect only toggles once B has been steady for 150 ms, because applying
+        // and removing effects from outside the game thread can clash with the game updating its effect list.
+        static uintptr_t fxHorse = 0; static int fxId = 0; static bool flameOn = false; static DWORD steadySince = 0;
+        if (boost != g_boosting) { g_boosting = boost; steadySince = GetTickCount(); }
+        if (boost != flameOn && GetTickCount() - steadySince >= 150)
         {
-            g_boosting = boost;
+            flameOn = boost;
             if (boost) { fxHorse = horse; fxId = g_boostFx; AddEffect(fxHorse, fxId); }
-            else { RemoveEffect(fxHorse, fxId); fxHorse = 0; }
-            Log(boost ? "boost on (fx %d)" : "boost off", fxId);
+            else if (fxHorse) { RemoveEffect(fxHorse, fxId); fxHorse = 0; }
+            Log(boost ? "flame on (fx %d)" : "flame off", fxId);
         }
         if (horse) { SetAnimSpeed(horse, boost ? g_boostRate : 1.0f); boostedHorse = horse; }
         else if (boostedHorse) { boostedHorse = 0; }
@@ -783,6 +865,8 @@ static DWORD WINAPI MainThread(LPVOID)
     FindSpEffectFunctions();
     FindBulletSpawn(singletons);
     g_worldChrMan = worldChrMan;
+    g_eventFlagMan = singletons.count("CSFD4VirtualMemoryFlag") ? singletons["CSFD4VirtualMemoryFlag"] : (singletons.count("CSEventFlagMan") ? singletons["CSEventFlagMan"] : 0);
+    Log("event flags %p; Tree Sentinel defeated flag = %d", (void*)g_eventFlagMan, GetFlag(kTreeSentinelDefeated));
     g_ballRunning = true; g_ballThread = CreateThread(nullptr, 0, BallThread, nullptr, 0, nullptr);
     PrepareSounds();
     for (int tries = 0; tries < 60 && !FindParamTable(L"SpEffectParam"); tries++) Sleep(500);
@@ -802,7 +886,7 @@ static DWORD WINAPI MainThread(LPVOID)
         if (FILE* bf = _wfopen((g_dir + L"boost.txt").c_str(), L"r")) { float r = 0; if (fscanf(bf, "%f", &r) == 1 && r >= 1 && r <= 5 && r != g_boostRate) { g_boostRate = r; Log("boost rate %.2f", r); } fclose(bf); }
         { static int curSfx = 0, curDmy = 0; int sfx = 625015, dmy = 900; // Crucible Knight fire breath at the exhaust marker added to the car model
           if (FILE* ff = _wfopen((g_dir + L"boost_fx.txt").c_str(), L"r")) { fscanf(ff, "%d %d", &sfx, &dmy); fclose(ff); }
-          if (sfx != curSfx || dmy != curDmy) { SetupBoostFlame(sfx, (short)dmy); curSfx = sfx; curDmy = dmy; } }
+          if ((sfx != curSfx || dmy != curDmy) && SetupBoostFlame(sfx, (short)dmy)) { curSfx = sfx; curDmy = dmy; } }
         if (uintptr_t pa = g_poseArray; pa && lastState == 13) { static int tick = 0; if (++tick % 4 == 0) { float a[12], b[12], c[12]; Read(pa + 1 * 48, a); Read(pa + 20 * 48, b); Read(pa + 60 * 48, c); Log("pose sample: [1] q %.3f %.3f %.3f %.3f  [20] q %.3f %.3f %.3f %.3f  [60] t %.3f %.3f %.3f", a[4], a[5], a[6], a[7], b[4], b[5], b[6], b[7], c[0], c[1], c[2]); } }
         {   // test keys until the ball exists: F9 = ball hit, F10 = goal (only while the game is in front)
             DWORD fpid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &fpid);
@@ -810,6 +894,9 @@ static DWORD WINAPI MainThread(LPVOID)
             bool n9 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F9) & 0x8000), n10 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F10) & 0x8000);
             if (n9 && !f9) { PlayRl(kHit); Log("played ball hit"); }
             if (n10 && !f10) { PlayRl(kGoal); Log("played goal"); }
+            static bool f6 = false; bool n6 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F6) & 0x8000);
+            if (n6 && !f6) { int before = GetFlag(kTreeSentinelDefeated); bool ok = SetFlag(kTreeSentinelDefeated, false); Log("F6 rematch: Tree Sentinel defeated flag %d -> %d (%s); rest at a grace or reload to respawn him", before, GetFlag(kTreeSentinelDefeated), ok ? "ok" : "failed"); PlayRl(kHit); }
+            f6 = n6;
             static bool f8 = false; bool n8 = fpid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F8) & 0x8000);
             if (n8 && !f8 && g_levelHorse) { int id = 3850310; if (FILE* bf2 = _wfopen((g_dir + L"ball_test.txt").c_str(), L"r")) { fscanf(bf2, "%d", &id); fclose(bf2); } Vec3 p{}; if (ChrPosition(g_levelHorse, p)) { p.y += 3; SpawnBullet(id, p); } }
             f8 = n8;
